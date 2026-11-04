@@ -1,0 +1,1327 @@
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import contextlib
+import logging
+import math
+import threading
+import time
+from typing import Any
+
+from pydantic import BaseModel
+
+from lerobot.robots import make_robot_from_config
+from lerobot.robots.bi_so_follower import BiSOFollower
+from lerobot.robots.so_follower import SO101Follower
+from lerobot.teleoperators import make_teleoperator_from_config
+from lerobot.teleoperators.bi_so_leader import BiSOLeader
+from lerobot.teleoperators.so_leader import SO101Leader
+from lerobot.utils.errors import DeviceNotConnectedError
+
+from .api_errors import ErrorCode
+from .arm_capabilities import require_known_arm_type
+from .arms import registry as arm_registry
+from .rest_pose import RETURN_CEILING_S
+from .session_events import notify_session_changed
+from .torque import de_energize_can_device, device_buses as _device_buses, force_disable_torque
+from .utils.devices import _force_close_device_resources
+from .utils.errors import classify_outcome, format_exception, friendly_hint
+from .utils.robot_factory import build_bimanual_configs, build_single_configs, request_arm_type
+
+logger = logging.getLogger(__name__)
+
+# sts3215 motor resolution; lerobot's DEGREES normalization uses (resolution - 1).
+_STS3215_MAX_RES = 4095
+
+# General URDF mapping. Rather than chase a per-joint "zero tick" (fragile — the
+# URDF's zero pose isn't reachable/meaningful for every joint), affinely map each
+# motor's *calibrated* travel [range_min, range_max] onto its URDF joint limits
+# [lower, upper]. Both ends are known per arm: the motor range comes from
+# calibration, the limits from so101_new_calib.urdf. So the on-screen model
+# tracks the real arm across its full range, with no clamping and no per-arm tick
+# constants. The only per-joint fact that can't be derived is `sign`: whether
+# motor-increasing maps to URDF-increasing (+1) or -decreasing (-1). Limits are
+# in radians (URDF units); the gripper is RANGE_0_100 (0-100), not degrees.
+_SO101_URDF_JOINTS = {
+    # motor_name: (urdf_joint, lower_rad, upper_rad, sign)
+    "shoulder_pan": ("Rotation", -1.91986, 1.91986, +1),
+    "shoulder_lift": ("Pitch", -1.74533, 1.74533, +1),
+    "elbow_flex": ("Elbow", -1.74533, 1.57080, +1),
+    "wrist_flex": ("Wrist_Pitch", -1.65806, 1.65806, +1),
+    "wrist_roll": ("Wrist_Roll", -2.79253, 2.79253, +1),
+    "gripper": ("Jaw", -0.174533, 1.74533, +1),
+}
+
+
+def _motor_fraction(motor_name: str, value: float, cal) -> float | None:
+    """Position of ``value`` within the motor's calibrated travel, as a 0..1 fraction.
+
+    Returns ``None`` when a body (DEGREES) joint has no calibration to define its
+    range, so the caller can fall back instead of guessing.
+    """
+    if motor_name == "gripper":
+        # RANGE_0_100 norm mode: the observation already is a 0-100 percentage.
+        return value / 100.0
+    if cal is None:
+        return None
+    # DEGREES norm mode: value = (ticks - mid) * 360 / max_res, i.e. symmetric
+    # about 0 across the calibrated range, so 0.5 sits at the midpoint.
+    full_range_deg = (cal.range_max - cal.range_min) * 360.0 / _STS3215_MAX_RES
+    if full_range_deg <= 0:
+        return None
+    return 0.5 + value / full_range_deg
+
+
+# Global variables for teleoperation state
+teleoperation_active = False
+teleoperation_thread: threading.Thread | None = None
+current_robot = None
+current_teleop = None
+# Set by the worker's cleanup when torque disable/disconnect failed, i.e. an arm
+# may be left energized (rigid). Cleared on start; surfaced in the stop response
+# and the /teleoperation-status payload so the frontend can warn the user.
+last_cleanup_error: str | None = None
+# Terminal error taxonomy of the most recent session (the in-process twin of
+# rollout's exited payload; complements last_cleanup_error, which stays the
+# raw "torque may still be enabled" safety text). `last_session_outcome` is
+# "ok" | "ran_with_warning" | "failed" (None before any session ends);
+# `last_session_error` is the error behind it — the caught loop exception
+# formatted as "Type: message" (the worker's catch site holds the actual
+# exception object; no log forensics), or the cleanup problem text when only
+# teardown tripped. Classified by catch site: a mid-loop exception is a failed
+# session; a user-requested stop whose cleanup complained (e.g. a gripper
+# overload on torque disable) ran fine — a warning. Cleared on start.
+last_session_outcome: str | None = None
+last_session_error: str | None = None
+# Guards the start path; the worker owns disconnect so stop() does not race.
+_state_lock = threading.Lock()
+
+# Grace period between a *user-initiated* stop and the torque release, used by
+# RECORDING only (makermodslab/record.py imports hold_torque_release_grace; recording
+# has no return-to-start — its last pose may be deliberate — so the timed hold
+# gives the operator a window to get a hand on the arm). Teleoperation stops
+# no longer hold: the servos already hold their last goal on their own in
+# position mode, so the stop drives the follower straight back to its
+# session-start pose (see makermodslab/rest_pose.py) — same behavior as the
+# auto-calibration stop — then releases. CAN error paths also attempt the
+# return and require a successful verdict before automatic torque release.
+TORQUE_RELEASE_GRACE_S = 5.0
+# True while the worker is driving the follower back to its rest pose (and on
+# through the release). The session is no longer "active" (the control loop
+# has exited) but the serial ports are still held and the arms are still
+# energized — surfaced in the status payload so the UI isn't lying about the
+# arm's state.
+releasing = False
+# Retain ownership after a failed CAN landing. Only explicit release_now may bypass it.
+rest_failed = False
+_requires_verified_rest = False
+# Explicit release aborts a CAN return. SO-101 also retains its second-stop
+# and pending-start release behavior. Cleared on start.
+_release_now = threading.Event()
+
+# --- Follower power telemetry ---
+# Present_Current (register 69, 2 bytes, read-only; absent from the pinned
+# sign-magnitude encoding table, so reads come back as plain magnitudes) is
+# the servo's MEASURED winding current, 6.5 mA per LSB per Feetech's STS3215
+# memory table — the honest signal for validating the motor-power cap.
+# Present_Load (register 60) is a signed PWM duty in 0.1% units, i.e.
+# commanded effort, not measured draw — deliberately not used. Sampled at
+# ~1 Hz inside the teleop loop: one sync_read per second per FOLLOWER bus,
+# piggybacked on the broadcast tick so it adds no extra loop overhead. If a
+# firmware revision leaves the register at 0, the summary shows all-zero
+# peaks — that is the register being unpopulated, not zero current.
+_PRESENT_CURRENT_REGISTER = "Present_Current"
+_CURRENT_MA_PER_UNIT = 6.5
+_CURRENT_SAMPLE_INTERVAL_S = 1.0
+
+
+class PowerTelemetry:
+    """Per-motor peak/mean Present_Current (mA) across a teleop session.
+
+    Gives an objective A/B for the motor-power cap: run once at 100% and once
+    at 30% against the same manual resistance and compare the logged peaks —
+    no subjective feel test needed. Sampling and summarizing never raise.
+    """
+
+    def __init__(self) -> None:
+        self.peak_ma: dict[str, float] = {}
+        self.latest_ma: dict[str, float] = {}
+        self._sum_ma: dict[str, float] = {}
+        self._n: dict[str, int] = {}
+
+    def sample(self, bus, prefix: str = "") -> None:
+        """One Present_Current sync_read on a follower bus; never raises."""
+        try:
+            raw = bus.sync_read(_PRESENT_CURRENT_REGISTER, normalize=False)
+        except Exception as e:
+            logger.debug(f"Power telemetry sample failed: {e}")
+            return
+        for motor, value in raw.items():
+            ma = abs(float(value)) * _CURRENT_MA_PER_UNIT
+            key = f"{prefix}{motor}"
+            self.latest_ma[key] = round(ma, 1)
+            self.peak_ma[key] = max(self.peak_ma.get(key, 0.0), ma)
+            self._sum_ma[key] = self._sum_ma.get(key, 0.0) + ma
+            self._n[key] = self._n.get(key, 0) + 1
+
+    def summary(self) -> str | None:
+        """One INFO-ready line of per-motor peaks/means, or None if no samples."""
+        if not self._n:
+            return None
+        parts = [
+            f"{motor} peak {self.peak_ma[motor]:.0f}mA / mean {self._sum_ma[motor] / self._n[motor]:.0f}mA"
+            for motor in self.peak_ma
+        ]
+        return f"power telemetry: {'; '.join(parts)}"
+
+
+def hold_torque_release_grace(
+    release_now: threading.Event,
+    grace_s: float = TORQUE_RELEASE_GRACE_S,
+    label: str = "arms",
+) -> bool:
+    """Keep the arm(s) energized for up to ``grace_s`` seconds before release.
+
+    "Holding" is just *not disabling torque yet* — the servos hold their last
+    goal on their own in position mode. Waits on ``release_now`` so a second
+    stop press (or a new start that needs the ports) can cut the hold short.
+    Returns True when cut short, False when the full grace elapsed.
+
+    This only *delays* the release; the caller must still run its
+    force_disable_torque + disconnect cleanup afterwards, unconditionally.
+    """
+    logger.info(
+        "Holding torque on the %s for up to %.0f s — guide the arm to a rest position "
+        "(stop again to release now)",
+        label,
+        grace_s,
+    )
+    cut_short = release_now.wait(timeout=grace_s)
+    logger.info("Grace hold on the %s finished: %s", label, "release-now" if cut_short else "elapsed")
+    return cut_short
+
+
+def finish_pending_release(timeout: float = 10.0) -> bool:
+    """Cut a pending torque-release grace short and wait for its cleanup.
+
+    Called by start paths (teleoperation and recording) so a start arriving
+    during the grace window releases the arms and frees the serial ports
+    immediately instead of failing port-busy for the rest of the grace.
+    Returns True when no teleoperation worker is running afterwards (the ports
+    are free as far as teleoperation is concerned); False when a live session
+    is running or the worker did not exit in time.
+    """
+    global teleoperation_thread
+
+    worker = teleoperation_thread
+    if worker is None or not worker.is_alive():
+        return True
+    if _requires_verified_rest:
+        # Starting another session must not turn a pending/failed landing into torque-off.
+        return False
+    if teleoperation_active:
+        # A live session, not a pending release — the caller's mutex check
+        # will report "already active".
+        return False
+    _release_now.set()
+    worker.join(timeout=timeout)
+    if worker.is_alive():
+        return False
+    teleoperation_thread = None
+    return True
+
+
+# Bound on how long stop_and_wait() waits for the graceful return-to-rest +
+# torque release to finish on its own before forcing an immediate release.
+# return_to_rest_pose's own RETURN_CEILING_S already bounds the return motion
+# itself (and bimanual arms return concurrently, not sequentially — see
+# _return_followers_to_rest — so this doesn't need to account for two arms in
+# series); the margin covers the torque-release writes, disconnect, and
+# thread-join overhead that follow it.
+_STOP_AND_WAIT_TIMEOUT_S = RETURN_CEILING_S + 5.0
+
+
+def stop_and_wait(timeout: float = _STOP_AND_WAIT_TIMEOUT_S) -> None:
+    """Stop teleoperation and block until the worker has actually released
+    the arm(s), for a caller with no UI to poll and no "press Stop again"
+    gesture available (shutdown).
+
+    handle_stop_teleoperation()'s first call is deliberately fire-and-forget:
+    it flips teleoperation_active and returns immediately so the request
+    thread isn't blocked on the return-to-rest motion, relying on a status
+    poll or a second Stop press to observe or force completion. Neither
+    exists at shutdown. This composes both: trigger the stop, then join the
+    worker — giving it its normal grace to finish the graceful return-to-rest
+    and release on its own, and only forcing an immediate release (the same
+    "second stop" mechanism a human pressing Stop twice would trigger) if it
+    hasn't finished within the bound. A no-op when idle.
+    """
+    if teleoperation_active:
+        handle_stop_teleoperation()
+    worker = teleoperation_thread
+    if worker is None or not worker.is_alive():
+        return
+    worker.join(timeout=timeout)
+    if not worker.is_alive():
+        return
+    if _requires_verified_rest:
+        logger.error(
+            "CAN teleoperation has not landed; automatic torque release is blocked. Support the arm."
+        )
+        return
+    logger.warning(
+        "Teleoperation worker did not finish its graceful release within %.0fs; forcing release now",
+        timeout,
+    )
+    _release_now.set()
+    worker.join(timeout=5.0)
+    if worker.is_alive():
+        logger.warning("Teleoperation worker still alive after forcing release; giving up the wait")
+
+
+class TeleoperateRequest(BaseModel):
+    leader_port: str
+    follower_port: str
+    leader_config: str
+    follower_config: str
+    # Bimanual: the primary pair above is the LEFT arm; these add the right arm.
+    mode: str = "single"
+    right_leader_port: str = ""
+    right_follower_port: str = ""
+    right_leader_config: str = ""
+    right_follower_config: str = ""
+    # Robot record name: loads per-robot gripper settings and supplies the BiSO
+    # staging base id (bimanual). Calibration selection uses the fields above.
+    robot_name: str = ""
+    # Hardware family: "so101" (Feetech serial) or "maker" (RobStride CAN
+    # follower + Star Arm 102 leader). Decides which lerobot config classes the
+    # robot factory builds, which calibration library the names resolve in, and
+    # which of the Feetech-only safety helpers apply. Defaults to so101 so a
+    # request from a client that predates the Maker arm is unchanged.
+    arm_type: str = "so101"
+    # Which of the family's leaders drives the follower (the record's
+    # leader_kind; blank = the family's default). Only the Metal arm offers a
+    # choice today: its Star Arm 102 or a second, gravity-compensated Metal
+    # arm — an ENERGIZED leader, returned and released on a stop like a
+    # follower. Read through the family; nothing here compares it.
+    leader_kind: str | None = None
+    # Escape hatch for the arm-identity guard (see makermodslab/arm_identity.py):
+    # when true, start even if the connected arms don't match their calibrations.
+    skip_identity_check: bool = False
+
+
+def get_joint_positions_from_robot(
+    robot, prefix: str = "", calibration=None, *, observation=None
+) -> dict[str, float]:
+    """
+    Extract current joint positions from the robot and convert to URDF joint format.
+
+    Args:
+        robot: The robot instance (SO101Follower, or a BiSO* arm).
+        prefix: Motor-key prefix in the observation. "" for single-arm; for a
+            bimanual BiSO robot pass "left_"/"right_" to pull one arm.
+        calibration: Calibration dict to use for the URDF correction. Defaults to
+            ``robot.calibration``; for a BiSO robot pass the sub-arm's calibration.
+        observation: An already-read observation (recording); otherwise read the robot.
+
+    Returns:
+        Dictionary mapping URDF joint names to radian values
+    """
+    try:
+        observation = robot.get_observation() if observation is None else observation
+        calibration = calibration if calibration is not None else (getattr(robot, "calibration", None) or {})
+
+        joint_positions: dict[str, float] = {}
+        debug_rows = []
+        for motor_name, (urdf_joint_name, lower, upper, sign) in _SO101_URDF_JOINTS.items():
+            # Single-arm uses "<motor>.pos"; a bimanual BiSO robot prefixes both
+            # arms ("left_<motor>.pos"/"right_<motor>.pos"). Callers pass the
+            # prefix for bimanual; when unset, fall back to the left arm so a
+            # single-arm caller still gets something from a BiSO robot.
+            motor_key = f"{prefix}{motor_name}.pos"
+            if motor_key not in observation and not prefix and f"left_{motor_name}.pos" in observation:
+                motor_key = f"left_{motor_name}.pos"
+            if motor_key not in observation:
+                logger.warning(f"Motor {motor_key} not found in observation")
+                joint_positions[urdf_joint_name] = 0.0
+                continue
+
+            value = observation[motor_key]
+            frac = _motor_fraction(motor_name, value, calibration.get(motor_name))
+            if frac is None:
+                # No calibration for a DEGREES joint — render the raw normalized
+                # value as degrees so we still show *something* (uncalibrated).
+                urdf_rad = value * math.pi / 180.0
+            else:
+                # Affinely map the calibrated range onto the URDF limits; the
+                # clamp guards the rare case of driving slightly past calibration.
+                frac = min(1.0, max(0.0, frac))
+                if sign < 0:
+                    frac = 1.0 - frac
+                urdf_rad = lower + frac * (upper - lower)
+
+            joint_positions[urdf_joint_name] = urdf_rad
+            debug_rows.append(
+                f"{motor_name:14s} raw={value:+8.2f} → {urdf_joint_name:11s} = {urdf_rad * 180.0 / math.pi:+8.2f}°"
+            )
+
+        # Throttled debug print (~once per second at 20 Hz broadcast).
+        now = time.time()
+        if now - getattr(get_joint_positions_from_robot, "_last_log", 0) > 1.0:
+            get_joint_positions_from_robot._last_log = now
+            logger.info("[joint-debug]\n  " + "\n  ".join(debug_rows))
+
+        return joint_positions
+
+    except Exception as e:
+        logger.error(f"Error getting joint positions: {e}")
+        return {urdf[0]: 0.0 for urdf in _SO101_URDF_JOINTS.values()}
+
+
+def _can_joint_degrees(observation: dict, prefix: str = "") -> dict[str, float]:
+    """Extract one arm's finite motor angles from a shared observation."""
+    out: dict[str, float] = {}
+    for key, value in observation.items():
+        if not key.endswith(".pos"):
+            continue
+        motor = key[: -len(".pos")]
+        if prefix:
+            if not motor.startswith(prefix):
+                continue
+            motor = motor[len(prefix) :]
+        elif motor.startswith(("left_", "right_")):
+            continue
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            out[motor] = float(value)
+    return out
+
+
+def get_maker_joint_degrees(robot, prefix: str = "") -> dict[str, float]:
+    """Live CAN follower angles in degrees, keyed by unprefixed motor name."""
+    try:
+        return _can_joint_degrees(robot.get_observation(), prefix)
+    except Exception as e:
+        logger.error(f"Error reading CAN joint positions: {e}")
+        return {}
+
+
+def get_can_joint_data(robot, family, is_bimanual: bool, timestamp: float, *, observation=None) -> dict:
+    """Read once for both viewers and numeric telemetry; a failed read holds pose."""
+    try:
+        observation = robot.get_observation() if observation is None else observation
+    except Exception as e:
+        logger.error(f"Error reading CAN joint positions: {e}")
+        observation = {}
+    data = {"type": "joint_update", "timestamp": timestamp}
+    sides = (("left_", ""), ("right_", "_right")) if is_bimanual else (("", ""),)
+    for prefix, suffix in sides:
+        degrees = _can_joint_degrees(observation, prefix)
+        data[f"joints_deg{suffix}"] = degrees
+        data[f"joints{suffix}"] = family.urdf_joint_positions(degrees)
+    return data
+
+
+def _device_ports(device) -> str:
+    """Comma-separated serial port(s) of a device, for error messages."""
+    ports = [str(bus.port) for bus in _device_buses(device) if getattr(bus, "port", None)]
+    return ", ".join(ports) if ports else "unknown port"
+
+
+def _safe_disconnect(device, label: str = "device") -> str | None:
+    """Disconnect a robot/teleop device, swallowing (but logging) any error.
+
+    Used on cleanup paths so one device's failure can't leave the other
+    holding its serial port open. Returns an error message when the disconnect
+    failed — lerobot's disconnect is also what releases motor torque, so a
+    failure here can leave the arm energized (rigid) — or None on success.
+    """
+    if device is None:
+        return None
+    try:
+        device.disconnect()
+        return None
+    except Exception as e:
+        message = (
+            f"Failed to disconnect the {label} ({_device_ports(device)}): {e}. "
+            "TORQUE MAY STILL BE ENABLED — the arm can stay rigid; unplug its power to release it."
+        )
+        logger.error(message)
+        # Last resort (upstream): force-close the serial port(s) so a failed
+        # disconnect can't leave the port handle open until process exit.
+        # Buses live on sub-arms for bimanual BiSO devices, so hit those too.
+        for target in (device, getattr(device, "left_arm", None), getattr(device, "right_arm", None)):
+            if target is not None:
+                _force_close_device_resources(target, logger)
+        return message
+
+
+def _cleanup_after_setup_failure(
+    robot, teleop_device, robot_label: str = "follower arm", teleop_label: str = "leader arm"
+) -> str | None:
+    """Force-disable torque and disconnect both devices after a setup failure.
+
+    Shared by the single-arm and bimanual setup paths: either device may
+    already be configured (energized) by the time a *later* setup step
+    raises, so skipping the explicit disable — or dropping _safe_disconnect's
+    error text — would leave an arm energized with no warning surfaced.
+    Returns the joined problem text, or None when cleanup was clean.
+    """
+    problems = force_disable_torque(robot, robot_label)
+    problems += force_disable_torque(teleop_device, teleop_label)
+    for device, label in ((robot, robot_label), (teleop_device, teleop_label)):
+        error = _safe_disconnect(device, label)
+        if error:
+            problems.append(error)
+    return " ".join(problems) if problems else None
+
+
+def force_disconnect_partial(device, label: str = "device") -> list[str]:
+    """Release a device that may be only *partially* connected.
+
+    ``device.disconnect()`` is unusable after a failed ``connect()``. lerobot
+    guards it with ``@check_if_not_connected``, and a robot's ``is_connected``
+    is all-or-nothing (``bus.is_connected and all(cam.is_connected ...)``), so
+    when ``connect()`` opens the bus and then dies on a camera, the cameras
+    *after* the failing one in iteration order were never opened — the guard
+    sees ``is_connected == False`` and ``disconnect()`` raises
+    ``DeviceNotConnectedError`` immediately, releasing **nothing**. The bus
+    stays open and every already-opened camera keeps its background read thread
+    running, holding the OS device busy for the rest of the process. The next
+    connect attempt then dies on the leaked bus with the misleading
+    "FeetechMotorsBus is already connected", and its cameras time out against
+    the leaked read threads — the failure is self-perpetuating until restart
+    (diagnosed 2026-07-29 on the front/wrist rig).
+
+    Go component by component instead, each independently guarded, so a broken
+    camera can't strand the bus and vice versa. Safe on a fully connected,
+    partially connected, or already disconnected device.
+
+    Torque, motor-by-motor, before any of that: on a camera failure torque was
+    never enabled (configure() runs after the cameras), but a failure later in
+    connect() can leave it on. lerobot's bus.disconnect() does disable torque
+    itself, but — same reasoning as force_disable_torque's docstring — one
+    motor's failed write there aborts the disable for every motor after it on
+    that bus, leaving them energized *and* skipping closePort(). So
+    force_disable_torque disables each motor independently first, and the
+    disconnect() below is then called with disable_torque=False: the work is
+    already done, and re-running it only reintroduces the abort-before-close
+    failure mode. Same ordering as _cleanup_after_setup_failure uses for the
+    same "torque may already be enabled after an incomplete setup" situation.
+    force_disable_torque skips any bus whose port never opened and any bus
+    where no motor answers a ping, so this is safe to call unconditionally.
+
+    Returns the list of problem descriptions, empty when teardown was clean,
+    so callers can surface a partial teardown instead of silently discarding
+    it. Note this is the raw list, unlike _cleanup_after_setup_failure, which
+    joins its problems into a single ``str | None`` for its one caller —
+    leaving them separate here lets a caller count, filter, or join them as
+    it needs.
+    """
+    problems: list[str] = []
+    if device is None:
+        return problems
+    problems += force_disable_torque(device, label)
+    # Cameras next: they're the usual point of failure, and their read threads
+    # are what keep the device busy for the next attempt. ``.cameras`` covers
+    # both sides on a bimanual BiSO device (it merges the sub-arms' dicts).
+    for name, cam in (getattr(device, "cameras", None) or {}).items():
+        try:
+            cam.disconnect()
+        except DeviceNotConnectedError:
+            pass  # never opened (or already released) — nothing to do
+        except Exception as e:
+            message = f"Could not release {label} camera {name}: {e}"
+            logger.warning(message)
+            problems.append(message)
+    for bus in _device_buses(device):
+        try:
+            # disable_torque=False: force_disable_torque above already
+            # disabled every motor independently, and lerobot's default
+            # disconnect(disable_torque=True) would re-run the same pass with
+            # num_retry=5 — where the *first* unresponsive motor raises before
+            # closePort(), leaking the port and appending a second, misleading
+            # "could not release the bus" problem about a bus we then close by
+            # hand below. Same reasoning and same call as rollout.py,
+            # motor_power.py, identify.py and auto_calibrate.py.
+            if getattr(bus, "is_connected", True):
+                bus.disconnect(disable_torque=False)
+        except Exception as e:
+            port = getattr(bus, "port", None) or "unknown port"
+            message = f"Could not release {label} bus on {port}: {e}"
+            logger.warning(message)
+            problems.append(message)
+            # Last resort (same fallback utils/devices.py's
+            # _force_close_device_resources uses): force the port handle
+            # closed so a failed disconnect can't leave it open until process
+            # exit. Scoped per-bus (not delegated to that device-level
+            # helper) so bimanual sub-arm buses each get their own fallback.
+            port_handler = getattr(bus, "port_handler", None)
+            if port_handler is not None:
+                with contextlib.suppress(Exception):
+                    port_handler.clearPort()
+                with contextlib.suppress(Exception):
+                    port_handler.is_using = False
+                try:
+                    port_handler.closePort()
+                    logger.info(f"Force-closed {label} bus port on {port} after disconnect failure")
+                except Exception as close_exc:
+                    close_message = f"Failed to force-close {label} bus port on {port}: {close_exc}"
+                    logger.warning(close_message)
+                    problems.append(close_message)
+    return problems
+
+
+def _connect_bimanual(request: TeleoperateRequest):
+    """Build, connect, and configure a bimanual leader+follower pair.
+
+    Each side is a lerobot BiSO* device wrapping two SO101 arms (left = the
+    primary leader/follower pair, right = the right_* pair). lerobot loads each
+    sub-arm's calibration as "<base>_left/right.json" from a single dir, with no
+    way to point left/right at differently named library files, so we stage the
+    four arbitrarily-named library calibrations into per-device dirs under that
+    convention and point BiSO at those. Returns
+    (robot, teleop_device, identity_warnings) connected, or raises after
+    disconnecting any device. The staging copy fails fast with a clear per-slot
+    error if any library file is missing (before connect() drops into
+    interactive recalibration, which would hang this thread).
+    """
+    family = arm_registry.get(request_arm_type(request))
+    robot_config, teleop_config = build_bimanual_configs(request)
+
+    robot = BiSOFollower(robot_config)
+    teleop_device = BiSOLeader(teleop_config)
+
+    try:
+        # Connect each of the four buses, naming the one that fails.
+        for arm, label, port in (
+            (robot.left_arm, "left follower", request.follower_port),
+            (robot.right_arm, "right follower", request.right_follower_port),
+            (teleop_device.left_arm, "left leader", request.leader_port),
+            (teleop_device.right_arm, "right leader", request.right_leader_port),
+        ):
+            try:
+                arm.bus.connect()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not connect to the {label} arm on {port}. "
+                    "Make sure it's plugged in and powered on, then try again."
+                ) from e
+
+        # Arm-identity guard: all four arms, read-only, BEFORE write_calibration
+        # below can stamp a wrong file into a swapped arm's EEPROM. The sub-arm
+        # ids are BiSO staging aliases, so pass the real library stems (in
+        # arm-iteration order: left follower, right follower, left leader, right
+        # leader) for the identity comparison.
+        identity_warnings = family.verify_identity(
+            ((robot, "follower"), (teleop_device, "leader")),
+            skip=request.skip_identity_check,
+            config_names=[
+                request.follower_config,
+                request.right_follower_config,
+                request.leader_config,
+                request.right_leader_config,
+            ],
+        )
+
+        # Each sub-arm auto-loaded its calibration in __init__ (id=<base>_side);
+        # register it on the bus, then configure both sides. Teleop opens no
+        # cameras: it consumes no frames (only motor positions drive the URDF
+        # viewer), so lerobot gets no cameras and the browser handles any display.
+        for arm in (robot.left_arm, robot.right_arm, teleop_device.left_arm, teleop_device.right_arm):
+            arm.bus.write_calibration(arm.calibration)
+        robot.configure()
+        teleop_device.configure()
+        # Stock session torque (RAM Torque_Limit re-seeded from EEPROM) and a
+        # cleared Goal_Velocity speed cap — followers only, never the
+        # human-held leader; a failed write degrades to the previous value and
+        # is surfaced as a warning. See makermodslab/motor_power.py.
+        identity_warnings += family.prepare_follower_registers(robot, "follower arms")
+        logger.info("Successfully connected to both bimanual arms")
+        return robot, teleop_device, identity_warnings
+    except Exception as e:
+        # robot.configure() above may already have energized both follower
+        # sub-arms before a later step (e.g. teleop_device.configure()) failed
+        # — mirror the single-arm path's belt-and-braces cleanup instead of a
+        # bare disconnect, and stash the result on the exception so the caller
+        # (which has no robot/teleop_device of its own to clean up) can surface
+        # it as a warning instead of losing it.
+        e.cleanup_error = _cleanup_after_setup_failure(robot, teleop_device, "follower arms", "leader arms")
+        raise
+
+
+def _can_family_label(request) -> str:
+    """Human name of a CAN request's follower family, for messages and logs."""
+    return arm_registry.get(request_arm_type(request)).short_label
+
+
+def _connect_can(request: TeleoperateRequest):
+    """Connect a CAN follower (Maker or Metal) + Star Arm 102 leader pair.
+
+    Deliberately much shorter than the SO-101 path above, because the CAN
+    devices' own ``connect()`` already does everything that path hand-rolls:
+    it opens the bus, loads and registers the calibration, writes the MIT
+    follow gains, and enables torque. Re-implementing that here would only
+    add ways to diverge from it.
+
+    ``calibrate=False`` is not optional. lerobot's default is True, and on an
+    uncalibrated device that path calls ``calibrate()``, which blocks on
+    ``input()`` — in a headless worker thread that is an unkillable hang, not
+    an error. MakerMods Lab has already guaranteed a calibration file exists by
+    this point (``setup_calibration_files`` raises when it does not), so the
+    flag only ever suppresses a prompt that should be unreachable.
+
+    A failed FOLLOWER connect runs ``de_energize_can_device`` before raising,
+    and it is load-bearing on Metal, not belt-and-braces: the Damiao
+    handshake IS the motor enable command sent motor by motor, so a handshake
+    that raises partway has energized the motors that DID answer while
+    ``is_connected`` still reads False — the state every register-era cleanup
+    helper skips. (MakerFollower.connect() also cleans up after itself;
+    MetalFollower.connect() does not, so the explicit release here is the
+    only one Metal gets.)
+
+    None of the Feetech preflights run: see arm_capabilities.uses_feetech_bus.
+    Returns (robot, teleop_device, warnings) to match _connect_bimanual.
+    """
+    family = _can_family_label(request)
+    arm_family = arm_registry.get(request_arm_type(request))
+    leader_label = arm_family.leader_option(request.leader_kind).label
+    if request.mode == "bimanual":
+        robot_config, teleop_config = build_bimanual_configs(request)
+    else:
+        robot_config, teleop_config = build_single_configs(request)
+
+    # lerobot's own factories rather than a hardcoded class per branch: the
+    # CAN leaders have no device class of their own (the `_maker`/`_metal`
+    # variants are CONFIG-only presets that all resolve to RebotArm102Leader /
+    # BiRebot102Leader), so dispatching on the registered `config.type` is the
+    # only mapping guaranteed to stay correct if that changes upstream.
+    robot = make_robot_from_config(robot_config)
+    teleop_device = make_teleoperator_from_config(teleop_config)
+
+    if arm_family.supports_gripper_effort_control:
+        from .metal_gripper import install_metal_gripper
+
+        install_metal_gripper(robot, request.robot_name)
+
+    arm_family.prepare_teleoperation(robot)
+    arm_family.prepare_leader_following(robot)
+
+    try:
+        logger.info(f"Connecting to {family} follower arm(s)...")
+        try:
+            robot.connect(calibrate=False)
+        except Exception as e:
+            de_energize_can_device(robot, f"{family} follower arm")
+            raise RuntimeError(
+                f"Could not connect to the {family} follower arm on {request.follower_port}. "
+                "Check that the CAN adapter is plugged in, the arm is powered, and the "
+                "motors are in MIT mode, then try again."
+            ) from e
+
+        logger.info(f"Connecting to {leader_label} arm(s)...")
+        try:
+            teleop_device.connect(calibrate=False)
+        except Exception as e:
+            # An energized leader (the Metal leader) is a Damiao device like
+            # the follower: a handshake that raised partway has energized the
+            # motors that answered, and its connect() also disconnects with
+            # torque left on when the gravity model fails to load. Same
+            # recovery as the follower; a no-op on the Star leader (no CAN
+            # bus of its own to release).
+            de_energize_can_device(teleop_device, f"{leader_label} arm")
+            raise RuntimeError(
+                f"Could not connect to the {leader_label} on {request.leader_port}. "
+                "Make sure it's plugged in and powered on, then try again."
+            ) from e
+
+        logger.info(f"Successfully connected to the {family} arm pair")
+        return robot, teleop_device, []
+    except Exception as e:
+        # Same contract as _connect_bimanual: stash the cleanup outcome on the
+        # exception so the caller (which holds no device of its own yet) can
+        # surface it as a warning instead of losing it.
+        e.cleanup_error = _cleanup_after_setup_failure(
+            robot, teleop_device, f"{family} follower arm", f"{leader_label} arm"
+        )
+        raise
+
+
+def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=None) -> dict[str, Any]:
+    """Handle start teleoperation request.
+
+    Connects to both arms *synchronously* so that a connection failure (arm
+    unplugged, port busy, power off) is reported back to the caller, rather than
+    dying silently in the worker thread while the API has already claimed
+    success. Only the teleoperation loop runs in the background thread.
+    """
+    global teleoperation_active, teleoperation_thread, current_robot, current_teleop, last_cleanup_error
+    global releasing, rest_failed, _requires_verified_rest, last_session_outcome, last_session_error
+
+    from . import (
+        auto_calibrate as _auto_calibrate,
+        calibrate as _calibrate,
+        record as _record,
+        remote_host as _remote_host,
+        remote_inference as _remote_inference,
+        remote_teleoperate as _remote_teleoperate,
+        replay as _replay,
+        rollout as _rollout,
+        wiggle as _wiggle,
+    )
+
+    # Argument validation first: an arm type nothing registered is refused
+    # (400 robot.arm_type.unavailable) before anything is released, claimed
+    # or built — build_single_configs would otherwise ask the registry for it.
+    require_known_arm_type(request.arm_type)
+
+    # A previous session (teleop or recording) may still be holding torque for
+    # its release grace — cut it short so this start doesn't fail on a busy
+    # serial port. Best effort: failures are surfaced by the checks below.
+    finish_pending_release()
+    _record.finish_pending_release()
+
+    with _state_lock:
+        if teleoperation_active:
+            return {
+                "success": False,
+                "message": "Teleoperation is already active",
+                "code": ErrorCode.ROBOT_BUSY_TELEOPERATION,
+            }
+        if teleoperation_thread is not None and teleoperation_thread.is_alive():
+            # A stopped session's worker is still releasing the arms (grace was
+            # cut short above but the cleanup hasn't finished yet).
+            return {
+                "success": False,
+                "message": "The arms from the previous session are still being released. "
+                "Try again in a few seconds.",
+                "code": ErrorCode.ROBOT_BUSY_RELEASING,
+            }
+        if _record.recording_active:
+            return {
+                "success": False,
+                "message": "Recording is currently active. Stop it first.",
+                "code": ErrorCode.ROBOT_BUSY_RECORDING,
+            }
+        if _rollout.inference_active:
+            return {
+                "success": False,
+                "message": "Inference is currently active. Stop it first.",
+                "code": ErrorCode.ROBOT_BUSY_INFERENCE,
+            }
+        if _remote_inference.remote_inference_is_active():
+            return {
+                "success": False,
+                "message": "Remote inference is currently active. Stop it first.",
+                "code": ErrorCode.ROBOT_BUSY_REMOTE_INFERENCE,
+            }
+        if _calibrate.calibration_is_active():
+            return {
+                "success": False,
+                "message": "Calibration is currently active. Stop it first.",
+                "code": ErrorCode.ROBOT_BUSY_CALIBRATION,
+            }
+        if _auto_calibrate.auto_calibration_is_active():
+            return {
+                "success": False,
+                "message": "Auto-calibration is currently active. Stop it first.",
+                "code": ErrorCode.ROBOT_BUSY_AUTO_CALIBRATION,
+            }
+        if _wiggle.wiggle_active:
+            return {
+                "success": False,
+                "message": "A gripper wiggle is currently in progress. Wait for it to finish.",
+                "code": ErrorCode.ROBOT_BUSY_WIGGLE,
+            }
+        if _remote_host.hosting_active:
+            return {
+                "success": False,
+                "message": "This robot is hosted for remote teleoperation. Stop hosting first.",
+                "code": ErrorCode.ROBOT_BUSY_HOSTING,
+            }
+        if _remote_teleoperate.remote_teleoperation_active:
+            return {
+                "success": False,
+                "message": "Remote teleoperation is currently active. Stop it first.",
+                "code": ErrorCode.ROBOT_BUSY_REMOTE_TELEOPERATION,
+            }
+        if _replay.replay_active:
+            return {
+                "success": False,
+                "message": "Replay is currently active. Stop it first.",
+                "code": ErrorCode.ROBOT_BUSY_REPLAY,
+            }
+        # Lazy, because jobs imports this module back the same way.
+        from . import jobs as _jobs
+
+        if (training := _jobs.training_is_active()) is not None:
+            return {
+                "success": False,
+                "message": f"Training run '{training}' is using this machine. Stop it first.",
+                "code": ErrorCode.ROBOT_BUSY_TRAINING,
+            }
+        # Per-session state reset, under the same lock that claims the active
+        # flag: a stale _release_now from a previous session's double-stop
+        # would otherwise cut EVERY later grace/return short until the server
+        # restarts (regression-tested in tests/test_teleoperate.py).
+        teleoperation_active = True
+        last_cleanup_error = None
+        last_session_outcome = None
+        last_session_error = None
+        releasing = False
+        rest_failed = False
+        _requires_verified_rest = arm_registry.get(request.arm_type).requires_verified_rest
+        _release_now.clear()
+
+    # The claim above is the real state transition — broadcast the hint so
+    # every WS client (any page, any remote UI) refetches the status endpoint.
+    notify_session_changed("teleoperation", True)
+
+    robot = None
+    teleop_device = None
+    try:
+        logger.info(
+            f"Starting teleoperation with leader port: {request.leader_port}, follower port: {request.follower_port}"
+        )
+
+        family = arm_registry.get(request_arm_type(request))
+        if not family.uses_feetech_bus:
+            robot, teleop_device, identity_warnings = _connect_can(request)
+        elif request.mode == "bimanual":
+            robot, teleop_device, identity_warnings = _connect_bimanual(request)
+        else:
+            # Create robot and teleop configs (stages calibration files).
+            robot_config, teleop_config = build_single_configs(request)
+
+            # Connect synchronously. If either device fails to connect, clean up the
+            # other (so its serial port is released) and report the error — do NOT
+            # leave the caller thinking teleoperation started.
+            logger.info("Initializing robot and teleop device...")
+            robot = SO101Follower(robot_config)
+            teleop_device = SO101Leader(teleop_config)
+
+            # Connect each arm separately so the error names which one failed and
+            # tells the user what to do, instead of a generic "failed to start".
+            logger.info("Connecting to follower arm...")
+            try:
+                robot.bus.connect()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not connect to the follower arm on {request.follower_port}. "
+                    "Make sure it's plugged in and powered on, then try again."
+                ) from e
+
+            logger.info("Connecting to leader arm...")
+            try:
+                teleop_device.bus.connect()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not connect to the leader arm on {request.leader_port}. "
+                    "Make sure it's plugged in and powered on, then try again."
+                ) from e
+
+            # Arm-identity guard: read-only check that each connected arm matches
+            # its assigned calibration — swapped leader/follower ports still
+            # connect fine but would drive the arms with the wrong calibration.
+            # Must run BEFORE write_calibration below stamps the (possibly wrong)
+            # file into the servos' EEPROM. Raises on mismatch; the except path
+            # below disconnects both devices and surfaces the message.
+            identity_warnings = family.verify_identity(
+                ((robot, "follower"), (teleop_device, "leader")), skip=request.skip_identity_check
+            )
+
+            # Write calibration to motors' memory
+            logger.info("Writing calibration to motors...")
+            robot.bus.write_calibration(robot.calibration)
+            teleop_device.bus.write_calibration(teleop_device.calibration)
+
+            # Configure motors. Teleop opens no cameras: it consumes no frames
+            # (only motor positions drive the URDF viewer), so lerobot gets no
+            # cameras and the browser handles any camera display.
+            logger.info("Configuring motors...")
+            robot.configure()
+            teleop_device.configure()
+            # Stock session torque (RAM Torque_Limit re-seeded from EEPROM) and
+            # a cleared Goal_Velocity speed cap — follower only, never the
+            # human-held leader; a failed write degrades to the previous value
+            # and is surfaced as a warning. See makermodslab/motor_power.py.
+            identity_warnings += family.prepare_follower_registers(robot)
+            logger.info("Successfully connected to both devices")
+
+        current_robot = robot
+        current_teleop = teleop_device
+
+        # Capture the follower's rest pose now — after connect/identity guard,
+        # before the loop moves anything — so a normal stop can drive it back
+        # to where the user left it. Followers only, NEVER the human-held
+        # leader. The gripper is excluded: at stop time it may be holding an
+        # object, and returning it to its (likely open) starting width would
+        # drop the object mid-return.
+        # Both arm types capture a start pose and are driven back to it on a
+        # normal stop — an arm has no brakes, so cutting torque anywhere but
+        # near its resting pose drops it under gravity. Only the MECHANISM
+        # differs: an SO-101 is eased home by a Feetech profile velocity
+        # (rest_pose.py), a Maker arm by interpolating its MIT setpoint
+        # (maker_rest_pose.py), because a RobStride joint has no
+        # Goal_Position/Goal_Velocity register to hand the motion off to.
+        rest_poses = family.capture_rest_poses(robot)
+        # An ENERGIZED leader (the Metal arm's gravity-compensated leader)
+        # holds torque and has no brakes either: captured here and returned
+        # with the followers on a normal stop. Nothing on every other leader.
+        rest_poses += family.capture_leader_rest_poses(teleop_device)
+
+        # Stream the arms in the background; the worker owns disconnect so stop()
+        # does not race the serial bus from the request thread.
+        # A bimanual BiSO robot exposes left_arm/right_arm; broadcast both arms'
+        # joints so the frontend can drive two 3D viewers.
+        is_bimanual = hasattr(robot, "left_arm") and hasattr(robot, "right_arm")
+
+        # Power telemetry: ~1 Hz Present_Current samples per follower bus (see
+        # PowerTelemetry). Followers only — the leader's torque is off.
+        telemetry = PowerTelemetry()
+        # Present_Current is a Feetech register; an empty target list makes the
+        # sampling loop below a no-op for a Maker arm without branching in it.
+        telemetry_targets = (
+            list(zip(_device_buses(robot), ["left_", "right_"] if is_bimanual else [""], strict=False))
+            if family.uses_feetech_bus
+            else []
+        )
+
+        def teleoperation_worker():
+            global teleoperation_active, current_robot, current_teleop, last_cleanup_error, releasing
+            global last_session_outcome, last_session_error, rest_failed
+
+            logger.info("Starting teleoperation loop...")
+            stopped_normally = False
+            loop_error: str | None = None
+            try:
+                last_broadcast_time = 0
+                last_current_sample_time = 0.0
+                broadcast_interval = 0.05  # 20 FPS
+
+                while teleoperation_active:
+                    action = teleop_device.get_action()
+                    robot.send_action(action)
+
+                    current_time = time.time()
+                    if current_time - last_broadcast_time >= broadcast_interval:
+                        try:
+                            # Piggyback the ~1 Hz current sample on the
+                            # broadcast tick — no extra loop overhead, one
+                            # sync_read per second per follower bus.
+                            if current_time - last_current_sample_time >= _CURRENT_SAMPLE_INTERVAL_S:
+                                for bus, prefix in telemetry_targets:
+                                    telemetry.sample(bus, prefix)
+                                last_current_sample_time = current_time
+                            if not family.uses_feetech_bus:
+                                joint_data = get_can_joint_data(robot, family, is_bimanual, current_time)
+                            else:
+                                if is_bimanual:
+                                    joint_positions = get_joint_positions_from_robot(
+                                        robot, prefix="left_", calibration=robot.left_arm.calibration
+                                    )
+                                else:
+                                    joint_positions = get_joint_positions_from_robot(robot)
+                                joint_data = {
+                                    "type": "joint_update",
+                                    "joints": joint_positions,
+                                    "timestamp": current_time,
+                                }
+                                if is_bimanual:
+                                    joint_data["joints_right"] = get_joint_positions_from_robot(
+                                        robot, prefix="right_", calibration=robot.right_arm.calibration
+                                    )
+                            if telemetry.latest_ma:
+                                # Instantaneous follower current (mA), ~1 Hz
+                                # fresh; the frontend is free to ignore it.
+                                joint_data["follower_currents_ma"] = dict(telemetry.latest_ma)
+                            if websocket_manager and websocket_manager.active_connections:
+                                websocket_manager.broadcast_joint_data_sync(joint_data)
+                            last_broadcast_time = current_time
+                        except Exception as e:
+                            logger.error(f"Error broadcasting joint data: {e}")
+
+                    time.sleep(0.001)
+                # The loop exited because a stop request cleared the active
+                # flag — a *user-initiated* stop, so the graceful landing applies.
+                stopped_normally = True
+            except Exception as e:
+                logger.error(f"Error during teleoperation loop: {e}")
+                # In-process error taxonomy: this catch site holds the actual
+                # exception object, so format it straight into the status
+                # payload (no log forensics). A mid-loop exception means the
+                # session died on its own — a real failure, classified below.
+                loop_error = format_exception(e)
+            finally:
+                telemetry_summary = telemetry.summary()
+                if telemetry_summary:
+                    logger.info(telemetry_summary)
+                teleoperation_active = False
+                if (stopped_normally or family.requires_verified_rest) and not _release_now.is_set():
+                    releasing = True
+                    notify_session_changed("teleoperation", True, phase="releasing")
+                    return_problem = _return_before_release(family, rest_poses, _release_now)
+                    if return_problem:
+                        last_cleanup_error = return_problem
+                        last_session_error = loop_error or return_problem
+                        rest_failed = True
+                        logger.error(return_problem)
+                        notify_session_changed("teleoperation", True, phase="rest_failed")
+                        # Do not disconnect, disable, clear faults, or re-enable motors.
+                        # The controller retains its last commanded rest target. A
+                        # firmware fault/bus loss can still prevent physical holding.
+                        while not _release_now.wait(1 / 30):
+                            for arm, _pose in rest_poses:
+                                guard = getattr(arm, "teleop_safety", None)
+                                if guard is not None:
+                                    guard.hold()
+                # Belt and braces: disable torque explicitly before disconnect.
+                # disconnect() disables torque too, but if it fails partway the
+                # error is swallowed here and the arm stays energized (rigid) —
+                # so make the disable explicit, and make any failure loud.
+                # Every family releases the follower AND the leader: a
+                # leader without motors (the Star Arm 102) is a no-op inside
+                # the family's release, an energized one (the Metal leader)
+                # has its gravity thread stopped and its bus disabled there.
+                if family.uses_feetech_bus:
+                    problems = family.release_torque(robot, "follower arm")
+                    problems += family.release_torque(teleop_device, "leader arm")
+                else:
+                    problems = family.release_torque(robot, f"{family.short_label} follower arm")
+                    problems += family.release_torque(teleop_device, f"{family.short_label} leader arm")
+                for device, label in ((robot, "follower arm"), (teleop_device, "leader arm")):
+                    error = _safe_disconnect(device, label)
+                    if error:
+                        problems.append(error)
+                if last_cleanup_error:
+                    problems.insert(0, last_cleanup_error)
+                last_cleanup_error = " ".join(problems) if problems else None
+                # Catch-site classification: the loop exception (if any) is the
+                # session's error and means "failed" — the loop was cut short.
+                # A user-requested stop (stopped_normally) whose cleanup alone
+                # complained ran fine: "ran_with_warning" with the cleanup text
+                # as the error. A clean stop is "ok".
+                last_session_error = loop_error or last_cleanup_error
+                last_session_outcome = classify_outcome(stopped_normally, last_session_error)
+                logger.info("Teleoperation stopped")
+                teleoperation_active = False
+                releasing = False
+                rest_failed = False
+                current_robot = None
+                current_teleop = None
+                # Final release: cleanup (including error paths) is done and
+                # the ports are free.
+                notify_session_changed("teleoperation", False)
+
+        teleoperation_thread = threading.Thread(
+            target=teleoperation_worker, name="teleoperation-worker", daemon=True
+        )
+        teleoperation_thread.start()
+
+        response = {
+            "success": True,
+            "message": "Teleoperation started successfully",
+            "leader_port": request.leader_port,
+            "follower_port": request.follower_port,
+        }
+        # Warn-but-allow identity findings (EEPROM offsets differ from the file,
+        # e.g. a saved config assigned without recalibrating).
+        if identity_warnings:
+            response["warning"] = " ".join(identity_warnings)
+        return response
+
+    except Exception as e:
+        # Connection (or setup) failed before the loop started: release any
+        # device that did open, reset state, and surface the error. Mirrors
+        # the worker's normal cleanup below — robot.configure() above may
+        # already have written Torque_Enable=1 on the real follower servos
+        # before this fired, so skipping the explicit disable (or dropping
+        # _safe_disconnect's error text) would leave the arm energized with
+        # no warning surfaced. The bimanual path's _connect_bimanual already
+        # ran this same cleanup itself — it owns robot/teleop_device before
+        # this scope ever sees them — and stashed the result on the
+        # exception; reuse that instead of dropping it (running it again here
+        # would be a no-op anyway, since robot/teleop_device are still None
+        # for that path).
+        if hasattr(e, "cleanup_error"):
+            last_cleanup_error = e.cleanup_error
+        else:
+            last_cleanup_error = _cleanup_after_setup_failure(robot, teleop_device)
+        teleoperation_active = False
+        current_robot = None
+        current_teleop = None
+        # The claim above already broadcast active=True; undo the hint now
+        # that the setup failure released everything.
+        notify_session_changed("teleoperation", False)
+        logger.error(f"Failed to start teleoperation: {e}")
+        # str(e) is already a user-facing message for the connection failures
+        # raised above; the toast title supplies the "error starting" context.
+        response = {"success": False, "message": str(e)}
+        if last_cleanup_error:
+            response["warning"] = last_cleanup_error
+        return response
+
+
+def _return_before_release(family, rest_poses, abort_event) -> str | None:
+    """Require an explicit successful verdict from every brake-less CAN arm."""
+    try:
+        if family.requires_verified_rest:
+            for device, pose in rest_poses:
+                expected = set(getattr(getattr(device, "bus", None), "motors", {})) - {"gripper"}
+                if not expected.issubset(pose):
+                    raise ValueError("The captured rest pose is missing joints")
+        recovery_poses = [
+            (guard.recovery_drive() if (guard := getattr(device, "teleop_safety", None)) else device, pose)
+            for device, pose in rest_poses
+        ]
+        results = family.return_to_rest(recovery_poses, abort_event)
+        if not family.requires_verified_rest:
+            return None
+        if results and len(results) == len(rest_poses) and all(ok for ok, _ in results):
+            return None
+        reasons = "; ".join(reason for ok, reason in (results or []) if not ok)
+        reason = reasons or "No complete return-to-rest confirmation"
+    except Exception as exc:
+        reason = format_exception(exc)
+    return (
+        f"Return to rest failed: {reason.rstrip('.')}. Automatic torque release is blocked. "
+        "Support the arm, then explicitly release torque. Motor holding cannot be guaranteed after a hardware fault."
+    )
+
+
+def handle_stop_teleoperation(*, release_now: bool = False) -> dict[str, Any]:
+    """Handle stop teleoperation request.
+
+    First stop: signals the worker via `teleoperation_active = False`. The
+    control loop exits and the worker drives the follower(s) straight back to
+    their session-start pose (no timed hold — the servos hold their last goal
+    on their own in position mode), then releases torque — reported
+    immediately via `releasing: true` rather than blocking through the return.
+    CAN stops are idempotent, including lease expiry: a failed landing keeps
+    ownership until release_now=True explicitly requests torque-off. SO-101
+    retains its second-stop release behavior. Explicit release waits for
+    cleanup so any release problem is surfaced. The worker owns the disconnect
+    call either way, so this never races the serial bus from the request
+    thread.
+    """
+    global teleoperation_active, teleoperation_thread
+
+    worker = teleoperation_thread
+    if release_now and worker is not None and worker.is_alive():
+        logger.warning("Operator explicitly requested torque release; the arm must be supported")
+        _release_now.set()
+    if teleoperation_active:
+        logger.info("Stop teleoperation triggered from web interface")
+        teleoperation_active = False
+
+        if worker is None or not worker.is_alive():
+            # No worker is holding the arms (it already exited, or a start
+            # never spawned one) — nothing to hold torque with, so report the
+            # cleanup outcome directly, as before the grace period existed.
+            teleoperation_thread = None
+            if last_cleanup_error:
+                return {
+                    "success": True,
+                    "message": "Teleoperation stopped, but releasing the arms reported a problem",
+                    "warning": last_cleanup_error,
+                }
+            return {"success": True, "message": "Teleoperation stopped successfully"}
+
+        return {
+            "success": True,
+            # The port is still held and the arm is still energized while the
+            # return runs; the status endpoint reports the same flag.
+            "releasing": True,
+            "message": (
+                "Teleoperation stopped — the arm returns to its starting position, "
+                "then releases torque only after a successful return."
+                if _requires_verified_rest
+                else "Teleoperation stopped — the arm returns to its starting position, "
+                "then goes limp. Press Stop again to release it now."
+            ),
+        }
+
+    if worker is not None and worker.is_alive():
+        if _requires_verified_rest and not release_now:
+            return {
+                "success": True,
+                "releasing": True,
+                "rest_failed": rest_failed,
+                "message": last_cleanup_error
+                or "Returning to rest; automatic release requires a successful return.",
+                **({"warning": last_cleanup_error} if last_cleanup_error else {}),
+            }
+        # Second stop while the return (or the release cleanup) is still
+        # running: release immediately and wait so problems can be surfaced.
+        logger.info("Second stop during the rest-pose return — releasing the arms now")
+        _release_now.set()
+        worker.join(timeout=5.0)
+        if worker.is_alive():
+            logger.warning("Teleoperation worker did not exit within 5s")
+            return {
+                "success": True,
+                "message": "Release requested, but the worker has not shut down yet",
+                "warning": (
+                    "The teleoperation worker did not shut down within 5s, so the arms may not have "
+                    "been released. If an arm stays rigid, unplug its power to release it."
+                ),
+            }
+        teleoperation_thread = None
+        # The worker has exited, so its cleanup already ran; if disabling
+        # torque or disconnecting failed, tell the caller — the arm may still
+        # be energized.
+        if last_cleanup_error:
+            return {
+                "success": True,
+                "message": "Arms released, but the release reported a problem",
+                "warning": last_cleanup_error,
+            }
+        return {"success": True, "message": "Arms released"}
+
+    return {"success": False, "message": "No teleoperation session is active"}
+
+
+def handle_teleoperation_status() -> dict[str, Any]:
+    """Handle teleoperation status request"""
+    message = (
+        last_cleanup_error
+        if rest_failed
+        else (
+            "Returning the arm to its rest position…"
+            if releasing
+            else "Teleoperation status retrieved successfully"
+        )
+    )
+    return {
+        "teleoperation_active": teleoperation_active,
+        "available_controls": {
+            "stop_teleoperation": teleoperation_active or releasing,
+        },
+        # True during the post-stop rest-pose return: the session is over but
+        # the arm is still energized and the port is still held.
+        "releasing": releasing,
+        "rest_failed": rest_failed,
+        # Non-None when the last session's cleanup could not release an arm
+        # (torque may still be enabled); cleared when a new session starts.
+        "last_cleanup_error": last_cleanup_error,
+        # Terminal error taxonomy of the most recent session (in-process twin
+        # of rollout's exited payload): `outcome` classifies it (ok |
+        # ran_with_warning | failed, None before any session ends), `error` is
+        # the text behind it, `hint` a plain-language headline. A mid-loop
+        # death is "failed"; a user stop whose cleanup alone complained is
+        # "ran_with_warning" — the frontend styles it amber, not red.
+        "outcome": last_session_outcome,
+        "error": last_session_error,
+        "hint": friendly_hint(last_session_error),
+        "message": message,
+    }

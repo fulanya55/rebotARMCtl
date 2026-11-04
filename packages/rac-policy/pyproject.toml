@@ -1,0 +1,17 @@
+[project]
+name = "rac-policy"
+version = "0.1.0"
+description = "Policy process interface, action chunk scheduling, LeRobot and StarVLA adapters"
+requires-python = ">=3.12,<3.14"
+license = "Apache-2.0"
+dependencies = ["rac-link", "numpy>=1.26", "msgpack>=1.0", "websockets>=12"]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rac_policy"]
+
+[tool.uv.sources]
+rac-link = { workspace = true }

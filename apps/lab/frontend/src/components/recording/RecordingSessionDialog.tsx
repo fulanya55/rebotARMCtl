@@ -1,0 +1,1269 @@
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { Trans, useTranslation } from "react-i18next";
+import { Button } from "@/components/ui/button";
+import { useToast } from "@/hooks/use-toast";
+import {
+  RotateCcw,
+  SkipForward,
+  Play,
+  Pause,
+  Volume2,
+  VolumeX,
+} from "lucide-react";
+import {
+  getMuted,
+  setMuted as persistMuted,
+  playRecordingStartCue,
+  playResetStartCue,
+  playAutoAdvanceWarning,
+} from "@/lib/recordingAudio";
+import { useApi } from "@/contexts/ApiContext";
+import { useSessionHeartbeat } from "@/hooks/useSessionHeartbeat";
+import { useUnloadWarning } from "@/hooks/useUnloadWarning";
+import { ApiError } from "@/lib/apiClient";
+import { startSession, stopSession, formatSessionHeld } from "@/lib/sessionApi";
+import { tabOwnerId } from "@/lib/sessionOwner";
+import { doneConfirmCopy, quitConfirmCopy } from "@/lib/recordingExit";
+import { useLanguage } from "@/contexts/LanguageContext";
+import { isCaselessScript } from "@/i18n/config";
+import { cn } from "@/lib/utils";
+import LogPanel from "@/components/LogPanel";
+import EpisodeTaskPrompt from "@/components/recording/EpisodeTaskPrompt";
+import SessionLiveView from "@/components/control/SessionLiveView";
+import { useRobots } from "@/hooks/useRobots";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+
+export interface RecordingConfig {
+  /** Robot RECORD name — POST /api/v1/sessions resolves ports, configs, mode,
+   * right-arm fields and cameras from it server-side; the request carries
+   * nothing hardware-shaped. */
+  robot: string;
+  dataset_repo_id: string;
+  single_task: string;
+  /** Wait before each episode to enter its task (the "naming" phase). */
+  per_episode_task: boolean;
+  num_episodes: number;
+  episode_time_s: number;
+  reset_time_s: number;
+  fps: number;
+  video: boolean;
+  push_to_hub: boolean;
+  resume: boolean;
+  streaming_encoding: boolean;
+}
+
+/** Handoff payload for a session that saved (or discarded) a dataset —
+ * consumed by CollectHandoff via router state (see CollectPanel's onExit). */
+export interface RecordedInfo {
+  repo_id: string;
+  saved_episodes: number;
+  discarded_empty: boolean;
+}
+
+type Phase = "preparing" | "recording" | "naming" | "resetting" | "completed";
+
+interface BackendStatus {
+  recording_active: boolean;
+  current_phase: string;
+  preparation_message?: string | null;
+  // Only meaningful while current_phase === "reconnecting_robot" — which
+  // connect attempt is about to be retried, out of connect_retry_max.
+  connect_retry_attempt?: number;
+  connect_retry_max?: number;
+  current_episode?: number;
+  total_episodes?: number;
+  saved_episodes?: number;
+  phase_elapsed_seconds?: number;
+  phase_time_limit_s?: number;
+  session_elapsed_seconds?: number;
+  session_ended?: boolean;
+  dataset_repo_id?: string;
+  // True only during the reset phase, while a pause is actively freezing it.
+  // Distinct from the unrelated `paused`/`streamsPaused` naming used by
+  // camera-preview components elsewhere — see CameraConfiguration.tsx.
+  paused?: boolean;
+  // True whenever a pause is set at all, including one armed during the
+  // recording phase for the upcoming reset gap (not yet actually freezing
+  // anything). Drives the Pause/Resume toggle, which is available in both
+  // the recording and resetting phases.
+  pause_armed?: boolean;
+  // True when the session saved zero episodes and its dataset directory was
+  // discarded (see record.py). The exit handoff shows a "nothing was saved"
+  // variant when this is set.
+  discarded_empty?: boolean;
+  // Terminal error taxonomy for an ended session (see record.py): `outcome`
+  // classifies it, `error` is the caught exception's "Type: message" text,
+  // `hint` a plain-language headline. ran_with_warning = the episodes are
+  // safe and only teardown tripped — styled amber, not as a failure.
+  outcome?: "ok" | "ran_with_warning" | "failed" | null;
+  error?: string | null;
+  hint?: string | null;
+  // Per-episode-task sessions: what to prefill the "name this episode's task"
+  // prompt with (the previous episode's task, or single_task before the first
+  // is named). Only meaningful while current_phase === "naming".
+  current_episode_task_default?: string;
+  available_controls: {
+    stop_recording: boolean;
+    exit_early: boolean;
+    rerecord_episode: boolean;
+    pause_recording: boolean;
+    resume_recording: boolean;
+    // True only during the "naming" phase.
+    submit_episode_task?: boolean;
+  };
+}
+
+/**
+ * The live recording session as a modal dialog over the Launchpad/studio —
+ * replaces the old /recording page (the session logic is ported verbatim;
+ * every navigate-home became `onExit`). The dialog can't be dismissed by
+ * ESC / outside click / X: leaving a live session is only ever an explicit
+ * Done or Quit. An abandoned page (tab close, crash) is the server's problem
+ * now — the session's lease expires and the safety stop keeps what was saved.
+ */
+const RecordingSessionDialog: React.FC<{
+  config: RecordingConfig;
+  /** Called for every exit. `recorded` present ⇒ the session ended with a
+   * dataset outcome to hand off (train/upload banner); absent ⇒ plain leave
+   * (quit, discard, start failure). */
+  onExit: (recorded?: RecordedInfo) => void;
+}> = ({ config: recordingConfig, onExit }) => {
+  const { records } = useRobots();
+  const recordingRobot = records[recordingConfig.robot];
+  const { toast } = useToast();
+  const { t } = useTranslation();
+  const { language } = useLanguage();
+  const isCJK = isCaselessScript(language);
+  const { baseUrl, fetchWithHeaders } = useApi();
+
+  // Backend status state - this is the single source of truth
+  const [backendStatus, setBackendStatus] = useState<BackendStatus | null>(
+    null
+  );
+  const [recordingSessionStarted, setRecordingSessionStarted] = useState(false);
+  const [initialTask, setInitialTask] = useState<string | null>(null);
+  const pendingInitialTaskRef = useRef<string | null>(null);
+  const [logs, setLogs] = useState("");
+
+  const [optimisticPhase, setOptimisticPhase] = useState<Phase | null>(null);
+  const [optimisticPaused, setOptimisticPaused] = useState<boolean | null>(null);
+  // A per-episode-task submission is in flight — locks the prompt's button
+  // until the poll moves the phase on (or the request comes back refused).
+  const [submittingTask, setSubmittingTask] = useState(false);
+  // The two explicit exits while a session is live: Done (finish + keep) and
+  // Quit (end without saving / discard). Each gets its own confirm dialog.
+  const [showDoneConfirm, setShowDoneConfirm] = useState(false);
+  const [showQuitConfirm, setShowQuitConfirm] = useState(false);
+  const [muted, setMutedState] = useState<boolean>(() => getMuted());
+  const prevRealPhaseRef = useRef<Phase | null>(null);
+  // Bumps on each re-record so the auto-advance warning re-fires for the same episode number.
+  const [rerecordTick, setRerecordTick] = useState(0);
+  const warningFiredForPhaseRef = useRef<{ phase: Phase | null; episode: number | null; tick: number }>({ phase: null, episode: null, tick: 0 });
+  // Guards against React StrictMode double-invocation of the start effect.
+  const startInitiatedRef = useRef(false);
+  // The arm-identity guard runs inside the backend's recording worker (after
+  // the start response), so its warn-but-allow findings arrive via the status
+  // poll. Show them once, not on every 1s tick.
+  const identityWarningShownRef = useRef(false);
+  // Set once we've captured an ended session with a failure/warning outcome
+  // we're surfacing inline (banner near the log panel, mirroring
+  // Inference.tsx). Freezes further polling so a later tick can't clobber the
+  // outcome/error/hint we're showing.
+  const doneRef = useRef(false);
+
+  // Latest onExit without threading it through every effect dependency (the
+  // caller's closure identity may change per render).
+  const onExitRef = useRef(onExit);
+  onExitRef.current = onExit;
+
+  const toggleMute = useCallback(() => {
+    setMutedState((prev) => {
+      const next = !prev;
+      persistMuted(next);
+      return next;
+    });
+  }, []);
+
+  // The session has ended (any outcome) once the backend reports it inactive
+  // AND session_ended. Live chrome (Advance/Stop, HUD, keyboard) unmounts at
+  // this point; the guard below disarms so post-end navigation is free.
+  const sessionEnded =
+    backendStatus !== null &&
+    !backendStatus.recording_active &&
+    backendStatus.session_ended === true;
+  const resume = recordingConfig?.resume ?? false;
+
+  // Identity of the session this dialog started (POST /api/v1/sessions).
+  const [sessionId, setSessionId] = useState<string | null>(null);
+
+  // While the session is live, renew its lease; if this tab goes away the
+  // missed heartbeats make the SERVER stop the session — episodes saved so
+  // far are KEPT (a lease-expiry stop never discards). The retired exit guard
+  // used to treat every unintentional leave as quit-WITHOUT-saving via a
+  // discard beacon; quit-without-saving is now strictly the explicit Quit
+  // button's semantics. The courtesy beforeunload below only keeps an
+  // accidental tab-close from walking away silently — no beacon, no
+  // unmount-stop.
+  const sessionLive = recordingSessionStarted && !sessionEnded;
+  useSessionHeartbeat(sessionId, tabOwnerId(), sessionLive);
+  useUnloadWarning(sessionLive);
+
+  // Collect the first task before starting the hardware session. The ref prevents
+  // React StrictMode (and any future re-renders) from POSTing the session
+  // start twice — the second call returns 409 and bounces the user out.
+  useEffect(() => {
+    if (recordingConfig.per_episode_task && initialTask === null) return;
+    if (!startInitiatedRef.current) {
+      startInitiatedRef.current = true;
+      startRecordingSession();
+    }
+    // startRecordingSession is intentionally omitted: re-running this effect
+    // on its identity change would re-fire the session start.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialTask, recordingConfig.per_episode_task]);
+
+  // Refs so the poll interval below stays stable and reads the latest values
+  // without tearing itself down on every state change.
+  const optimisticPhaseRef = useRef(optimisticPhase);
+  optimisticPhaseRef.current = optimisticPhase;
+  const optimisticPausedRef = useRef(optimisticPaused);
+  optimisticPausedRef.current = optimisticPaused;
+  const rerecordTickRef = useRef(rerecordTick);
+  rerecordTickRef.current = rerecordTick;
+  const submittingTaskRef = useRef(submittingTask);
+  submittingTaskRef.current = submittingTask;
+
+  // Poll backend status continuously to stay in sync
+  useEffect(() => {
+    if (!recordingSessionStarted) return;
+
+    const pollStatus = async () => {
+      // Once we've frozen on an ended-with-issue payload, stop polling: a
+      // later status would drop the outcome/error/hint we're showing.
+      if (doneRef.current) return;
+      try {
+        const response = await fetchWithHeaders(
+          `${baseUrl}/api/v1/recording-status`
+        );
+        if (!response.ok) return;
+        const status = await response.json();
+        setBackendStatus(status);
+
+        // Pull the recording log tail on the same tick so the panel stays live.
+        // Best-effort: a log fetch failure must not disturb status handling.
+        try {
+          const logRes = await fetchWithHeaders(
+            `${baseUrl}/api/v1/recording-log`
+          );
+          if (logRes.ok) {
+            const logData = await logRes.json();
+            setLogs(logData.logs ?? "");
+          }
+        } catch {
+          // Ignore; the next tick retries.
+        }
+
+        if (status.warning && !identityWarningShownRef.current) {
+          identityWarningShownRef.current = true;
+          toast({
+            title: t("recording.session.toast.startedWarningTitle"),
+            // Backend prose — stays as sent.
+            description: status.warning,
+            duration: 10000,
+          });
+        }
+
+        const currentOptimistic = optimisticPhaseRef.current;
+        if (currentOptimistic && status.current_phase === currentOptimistic) {
+          setOptimisticPhase(null);
+        } else if (
+          currentOptimistic === "naming" &&
+          status.current_phase !== "recording" &&
+          status.current_phase !== "naming"
+        ) {
+          // The naming phase was entered optimistically on exit-early; if the
+          // real phase has already moved past it (a fast submit landed before
+          // the first "naming" poll), clear the optimistic value so it can't
+          // wedge the prompt open for the rest of the session.
+          setOptimisticPhase(null);
+        }
+
+        const currentOptimisticPaused = optimisticPausedRef.current;
+        if (currentOptimisticPaused !== null && status.paused === currentOptimisticPaused) {
+          setOptimisticPaused(null);
+        } else if (
+          currentOptimisticPaused !== null &&
+          status.current_phase !== "resetting"
+        ) {
+          // Second line of defense: pause/resume is only meaningful during
+          // the reset phase, so once the real phase has moved past it, no
+          // failure mode (refused request, missed poll, race with the phase
+          // ending) can leave optimisticPaused wedged for the rest of the
+          // session — clear it regardless of whether it was ever confirmed.
+          setOptimisticPaused(null);
+        }
+
+        const real = status.current_phase as Phase;
+        const prev = prevRealPhaseRef.current;
+        if (prev !== real) {
+          if (real === "recording" && prev !== null) {
+            playRecordingStartCue();
+          } else if (real === "resetting" || (real === "naming" && prev === "recording")) {
+            playResetStartCue();
+          }
+          prevRealPhaseRef.current = real;
+          warningFiredForPhaseRef.current = { phase: null, episode: null, tick: 0 };
+        }
+
+        // The naming prompt locks its button on submit and waits for this
+        // poll to move the phase on; once it has, clear the flag so a later
+        // episode's prompt starts unlocked. Also covers a refused submission
+        // whose own handler already reset it.
+        if (real !== "naming" && submittingTaskRef.current) {
+          setSubmittingTask(false);
+        }
+
+        const elapsed = status.phase_elapsed_seconds || 0;
+        const limit = status.phase_time_limit_s || 0;
+        const inFinalThreeSeconds = limit > 3 && elapsed >= limit - 3;
+        const ep = status.current_episode ?? null;
+        const tick = rerecordTickRef.current;
+        const warned = warningFiredForPhaseRef.current;
+        if (
+          inFinalThreeSeconds &&
+          currentOptimistic === null &&
+          (warned.phase !== real ||
+            warned.episode !== ep ||
+            warned.tick !== tick)
+        ) {
+          playAutoAdvanceWarning();
+          warningFiredForPhaseRef.current = { phase: real, episode: ep, tick };
+        }
+
+        if (!status.recording_active && status.session_ended) {
+          // The session finished on its own (or a stop we issued completed and
+          // the backend returned to rest).
+          // A real failure or a cleanup-only warning: keep the user here so
+          // the hint + error banner (near the log panel) is readable instead
+          // of bouncing straight to upload. Freeze polling on this payload;
+          // the banner's Continue button exits on the user's own click.
+          if (
+            status.outcome === "failed" ||
+            status.outcome === "ran_with_warning"
+          ) {
+            doneRef.current = true;
+            return;
+          }
+          onExitRef.current({
+            repo_id: status.dataset_repo_id || recordingConfig.dataset_repo_id,
+            saved_episodes: status.saved_episodes || 0,
+            // The backend discards a session that saved zero episodes; when it
+            // did, the launchpad handoff shows a "nothing was saved" variant.
+            discarded_empty: status.discarded_empty || false,
+          });
+        }
+      } catch (error) {
+        console.error("Error polling recording status:", error);
+      }
+    };
+
+    pollStatus();
+    const statusInterval = setInterval(pollStatus, 1000);
+    return () => clearInterval(statusInterval);
+  }, [recordingSessionStarted, recordingConfig, baseUrl, fetchWithHeaders, toast, t]);
+
+  const formatTime = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, "0")}:${secs
+      .toString()
+      .padStart(2, "0")}`;
+  };
+
+  const startRecordingSession = async () => {
+    try {
+      // The request is the robot NAME plus the dataset-shaped options — the
+      // server resolves ports/configs/cameras from the saved record. The
+      // owner attaches the lease the heartbeat above renews.
+      const { robot, ...options } = recordingConfig;
+      const { session } = await startSession(baseUrl, fetchWithHeaders, {
+        kind: "recording",
+        robot,
+        owner: tabOwnerId(),
+        options: { ...options, single_task: initialTask ?? options.single_task },
+      });
+      setSessionId(session.id);
+      setRecordingSessionStarted(true);
+      toast({
+        title: t("recording.session.toast.startedTitle"),
+        description: t("recording.session.toast.startedBody", {
+          count: recordingConfig.num_episodes,
+        }),
+      });
+    } catch (error) {
+      if (error instanceof ApiError) {
+        // The backend refused the start. 409 session.held renders as the
+        // shared localized "robot is busy" line (details name the holder);
+        // every other coded refusal (robot.not_ready, request.validation —
+        // apiRequest already flattened a 422's array shape) shows the
+        // server's own prose, with a localized last-resort fallback.
+        toast({
+          title: t("recording.session.toast.startFailedTitle"),
+          description:
+            formatSessionHeld(t, error) ??
+            error.detail ??
+            t("recording.session.toast.startFailedBody"),
+          variant: "destructive",
+        });
+      } else {
+        // Never reached the backend — nothing started.
+        toast({
+          title: t("recording.session.toast.connectionErrorTitle"),
+          description: t("recording.session.toast.connectionErrorBody"),
+          variant: "destructive",
+        });
+      }
+      onExitRef.current();
+    }
+  };
+
+  const handleExitEarly = useCallback(async () => {
+    if (!backendStatus?.available_controls.exit_early) return;
+    if (optimisticPhase !== null) return;
+
+    const realPhase = backendStatus.current_phase as Phase;
+    const next: Phase | null =
+      realPhase === "recording"
+        ? "resetting"
+        : realPhase === "resetting" ? "recording" : null;
+
+    if (!next) return;
+
+    if (!recordingConfig.per_episode_task) setOptimisticPhase(next);
+
+    try {
+      const response = await fetchWithHeaders(
+        `${baseUrl}/api/v1/recording-exit-early`,
+        { method: "POST" }
+      );
+      const data = await response.json();
+      // See handlePauseRecording: a refused exit-early also comes back as
+      // HTTP 200 + { success: false } (e.g. the reset phase is currently
+      // paused), not just a non-ok status.
+      if (!response.ok || !data.success) {
+        setOptimisticPhase(null);
+        toast({
+          // Body is the backend's own message — untranslated by design.
+          title: t("recording.session.toast.errorTitle"),
+          description: data.message,
+          variant: "destructive",
+        });
+      }
+    } catch (error) {
+      setOptimisticPhase(null);
+      toast({
+        title: t("recording.session.toast.connectionErrorTitle"),
+        description: t("recording.session.toast.connectionErrorBody"),
+        variant: "destructive",
+      });
+    }
+  }, [backendStatus, optimisticPhase, recordingConfig, baseUrl, fetchWithHeaders, toast, t]);
+
+  // Submit the upcoming task and start its recording. A refused request
+  // leaves the prompt open so the operator can correct it and retry.
+  const handleSubmitEpisodeTask = useCallback(
+    async (task: string) => {
+      if (submittingTask) return;
+      setSubmittingTask(true);
+      try {
+        const response = await fetchWithHeaders(
+          `${baseUrl}/api/v1/recording-episode-task`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ task }),
+          }
+        );
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+          toast({
+            // Body is the backend's own message — untranslated by design.
+            title: t("recording.session.toast.errorTitle"),
+            description: data.message,
+            variant: "destructive",
+          });
+          setSubmittingTask(false);
+        }
+        // On success leave the button locked: the 1 s poll picks up the phase
+        // change and the prompt unmounts. The naming-phase watchdog below
+        // clears the flag if that poll never arrives.
+      } catch (error) {
+        toast({
+          title: t("recording.session.toast.connectionErrorTitle"),
+          description: t("recording.session.toast.connectionErrorBody"),
+          variant: "destructive",
+        });
+        setSubmittingTask(false);
+      }
+    },
+    [submittingTask, baseUrl, fetchWithHeaders, toast, t]
+  );
+
+  // The first Space already requested capture. Submit once the backend is ready.
+  useEffect(() => {
+    if (backendStatus?.current_phase !== "naming") return;
+    const task = pendingInitialTaskRef.current;
+    if (task === null) return;
+    pendingInitialTaskRef.current = null;
+    void handleSubmitEpisodeTask(task);
+  }, [backendStatus?.current_phase, handleSubmitEpisodeTask]);
+
+  const handlePauseRecording = useCallback(async () => {
+    if (!backendStatus?.available_controls.pause_recording) return;
+    if (optimisticPaused !== null) return;
+
+    setOptimisticPaused(true);
+
+    try {
+      const response = await fetchWithHeaders(
+        `${baseUrl}/api/v1/recording-pause`,
+        { method: "POST" }
+      );
+      const data = await response.json();
+      // The backend returns HTTP 200 with { success: false } for a
+      // legitimately refused pause (e.g. the reset phase ended just as the
+      // request landed — a real, expected race). Treat that the same as a
+      // network error: roll the optimistic state back so a refused request
+      // never wedges the button.
+      if (!response.ok || !data.success) {
+        setOptimisticPaused(null);
+        toast({
+          // Body is the backend's own message — untranslated by design.
+          title: t("recording.session.toast.errorTitle"),
+          description: data.message,
+          variant: "destructive",
+        });
+      } else if ((optimisticPhase ?? backendStatus?.current_phase) === "recording") {
+        // Pausing mid-episode only arms the pause — it has no effect until
+        // the reset gap actually begins (see handle_pause_recording in
+        // record.py). Say so, since the button/status otherwise give no
+        // visible feedback during the recording phase.
+        toast({
+          title: t("recording.session.toast.pauseArmedTitle"),
+          description: t("recording.session.toast.pauseArmedBody"),
+        });
+      }
+    } catch (error) {
+      setOptimisticPaused(null);
+      toast({
+        title: t("recording.session.toast.connectionErrorTitle"),
+        description: t("recording.session.toast.connectionErrorBody"),
+        variant: "destructive",
+      });
+    }
+  }, [backendStatus, optimisticPaused, optimisticPhase, baseUrl, fetchWithHeaders, toast, t]);
+
+  const handleResumeRecording = useCallback(async () => {
+    if (!backendStatus?.available_controls.resume_recording) return;
+    if (optimisticPaused !== null) return;
+
+    setOptimisticPaused(false);
+
+    try {
+      const response = await fetchWithHeaders(
+        `${baseUrl}/api/v1/recording-resume`,
+        { method: "POST" }
+      );
+      const data = await response.json();
+      // See handlePauseRecording: a refused resume also comes back as HTTP
+      // 200 + { success: false }, not just a non-ok status.
+      if (!response.ok || !data.success) {
+        setOptimisticPaused(null);
+        toast({
+          // Body is the backend's own message — untranslated by design.
+          title: t("recording.session.toast.errorTitle"),
+          description: data.message,
+          variant: "destructive",
+        });
+      }
+    } catch (error) {
+      setOptimisticPaused(null);
+      toast({
+        title: t("recording.session.toast.connectionErrorTitle"),
+        description: t("recording.session.toast.connectionErrorBody"),
+        variant: "destructive",
+      });
+    }
+  }, [backendStatus, optimisticPaused, baseUrl, fetchWithHeaders, toast, t]);
+
+  // ENTER-key equivalent of the Pause/Resume button: toggles based on
+  // whichever of pause/resume is currently active, mirroring the button's
+  // own ternary so the keybind and click always agree.
+  const handleTogglePause = useCallback(() => {
+    const active = optimisticPaused ?? backendStatus?.pause_armed ?? false;
+    if (active) {
+      handleResumeRecording();
+    } else {
+      handlePauseRecording();
+    }
+  }, [optimisticPaused, backendStatus, handleResumeRecording, handlePauseRecording]);
+
+  const handleRerecordEpisode = useCallback(async () => {
+    if (!backendStatus?.available_controls.rerecord_episode) return;
+
+    try {
+      const response = await fetchWithHeaders(
+        `${baseUrl}/api/v1/recording-rerecord-episode`,
+        {
+          method: "POST",
+        }
+      );
+      const data = await response.json();
+
+      if (response.ok && data.success) {
+        setRerecordTick((t) => t + 1);
+        toast({
+          title: t("recording.session.toast.rerecordTitle"),
+          description: t("recording.session.toast.rerecordBody", {
+            // Same `?? 1` default the HUD's episode counter uses; the field is
+            // always populated on the re-record path.
+            index: (backendStatus.current_episode ?? 1) - (backendStatus.current_phase === "naming" ? 1 : 0),
+          }),
+        });
+      } else {
+        toast({
+          // Body is the backend's own message — untranslated by design.
+          title: t("recording.session.toast.errorTitle"),
+          description: data.message,
+          variant: "destructive",
+        });
+      }
+    } catch (error) {
+      toast({
+        title: t("recording.session.toast.connectionErrorTitle"),
+        description: t("recording.session.toast.connectionErrorBody"),
+        variant: "destructive",
+      });
+    }
+  }, [backendStatus, baseUrl, fetchWithHeaders, toast, t]);
+
+  // POST the session-end request. DONE (keep saved episodes; the poll then
+  // exits with the handoff) stops the session by its id — the same stop the
+  // lease watchdog uses. QUIT (end WITHOUT saving) keeps the kind-specific
+  // legacy endpoint: `discard` is recording-only semantics the generic
+  // sessions stop deliberately doesn't carry.
+  const doStopRecording = useCallback(
+    async (discard: boolean) => {
+      if (!backendStatus?.available_controls.stop_recording) return;
+      try {
+        if (discard || !sessionId) {
+          await fetchWithHeaders(
+            `${baseUrl}/api/v1/stop-recording${discard ? "?discard=true" : ""}`,
+            { method: "POST" }
+          );
+        } else {
+          try {
+            await stopSession(baseUrl, fetchWithHeaders, sessionId);
+          } catch (e) {
+            // 404: the session ended on its own a beat before the click —
+            // the poll exits with the handoff; nothing left to stop.
+            if (!(e instanceof ApiError && e.status === 404)) throw e;
+          }
+        }
+        toast(
+          discard
+            ? {
+                title: t("recording.session.toast.quittingTitle"),
+                description: t("recording.session.toast.quittingBody"),
+              }
+            : {
+                title: t("recording.session.toast.finishingTitle"),
+                description: t("recording.session.toast.finishingBody"),
+              }
+        );
+      } catch (error) {
+        toast({
+          title: t("recording.session.toast.errorTitle"),
+          description: t("recording.session.toast.stopFailedBody"),
+          variant: "destructive",
+        });
+      }
+    },
+    [backendStatus, sessionId, baseUrl, fetchWithHeaders, toast, t]
+  );
+
+  const requestDone = useCallback(() => {
+    if (!backendStatus?.available_controls.stop_recording) return;
+    setShowDoneConfirm(true);
+  }, [backendStatus]);
+
+  const requestQuit = useCallback(() => {
+    if (!backendStatus?.available_controls.stop_recording) return;
+    setShowQuitConfirm(true);
+  }, [backendStatus]);
+
+  const confirmDone = useCallback(async () => {
+    setShowDoneConfirm(false);
+    await doStopRecording(false);
+    // The poll detects session_ended and exits with the handoff payload.
+  }, [doStopRecording]);
+
+  const confirmQuit = useCallback(async () => {
+    setShowQuitConfirm(false);
+    await doStopRecording(true);
+    // Quit means leave now — don't wait for the backend's rest-return/cleanup
+    // (it finishes on its own in the worker). Close the dialog.
+    onExitRef.current();
+  }, [doStopRecording]);
+
+  // Leave the frozen outcome banner for the launchpad handoff — same `recorded`
+  // payload the auto-exit builds, on the user's own click. The handoff banner
+  // handles the zero-saved case (discarded_empty → "nothing was saved"). For
+  // an errored/warned session this is now the ONLY path off the ended screen
+  // when something was saved: it opens the dataset viewer in Finalize mode
+  // (CollectPanel), where keeping vs. discarding is a per-episode checkbox
+  // choice instead of a blind "keep everything" / "discard everything"
+  // fork — deleting every episode there falls back to deleting the whole
+  // dataset, so nothing is lost by dropping the old dedicated discard button.
+  const reviewAndFinalize = useCallback(() => {
+    if (!backendStatus) return;
+    onExitRef.current({
+      repo_id:
+        backendStatus.dataset_repo_id || recordingConfig.dataset_repo_id,
+      saved_episodes: backendStatus.saved_episodes || 0,
+      discarded_empty: backendStatus.discarded_empty || false,
+    });
+  }, [backendStatus, recordingConfig]);
+
+  // Re-record is keyboard-driven on DELETE (and Backspace, for keyboards/
+  // muscle memory where Delete sends Backspace — explicit user request; the
+  // old ArrowLeft binding was removed because a back-gesture keystroke
+  // discarding the in-progress episode felt accidental — Delete/Backspace is
+  // a deliberate "delete" gesture, and the handler still preventDefaults so
+  // it can never double as browser back-navigation). ENTER toggles Pause/Resume.
+  const anyExitDialogOpen = showDoneConfirm || showQuitConfirm;
+  const handlersRef = useRef({
+    handleExitEarly,
+    handleRerecordEpisode,
+    handleTogglePause,
+    requestDone,
+    anyExitDialogOpen,
+  });
+  useEffect(() => {
+    handlersRef.current = {
+      handleExitEarly,
+      handleRerecordEpisode,
+      handleTogglePause,
+      requestDone,
+      anyExitDialogOpen,
+    };
+  });
+
+  // Keyboard shortcuts are LIVE-only: once the session has ended, SPACE/→
+  // (advance) and Escape (finish) deactivate so a keystroke can't act on a
+  // session that no longer exists.
+  const keyboardActive =
+    recordingSessionStarted && backendStatus !== null && !sessionEnded;
+
+  useEffect(() => {
+    if (!keyboardActive) return;
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "BUTTON" || target.isContentEditable)) {
+        return;
+      }
+      if (e.key === " " || e.code === "Space" || e.key === "ArrowRight") {
+        e.preventDefault();
+        handlersRef.current.handleExitEarly();
+      } else if (e.key === "Backspace" || e.key === "Delete") {
+        // Deliberate delete gesture: discard and re-record the current episode.
+        // preventDefault also guarantees it never acts as browser back-nav.
+        e.preventDefault();
+        handlersRef.current.handleRerecordEpisode();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        handlersRef.current.handleTogglePause();
+      } else if (e.key === "Escape") {
+        if (handlersRef.current.anyExitDialogOpen) return;
+        // Escape = finish & keep (the least destructive exit). Quit is an
+        // explicit button click only.
+        handlersRef.current.requestDone();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [keyboardActive]);
+
+  const realPhase = backendStatus?.current_phase as Phase;
+  const currentPhase: Phase = optimisticPhase ?? realPhase;
+  // Phase-independent: true whether a pause is actively freezing the reset
+  // gap right now, or merely armed during the recording phase for the gap
+  // that follows. Drives the Pause/Resume button toggle in both phases.
+  const isPauseActive = optimisticPaused ?? backendStatus?.pause_armed ?? false;
+  // Narrower: true only while the reset gap is ACTUALLY frozen (used for
+  // the "RESET PAUSED" status text, which only makes sense during resetting).
+  const isRecordingPaused = currentPhase === "resetting" && isPauseActive;
+  const currentEpisode = backendStatus?.current_episode ?? 1;
+  const totalEpisodes =
+    backendStatus?.total_episodes ?? recordingConfig.num_episodes;
+
+  const phaseElapsedTime = optimisticPhase
+    ? 0
+    : backendStatus?.phase_elapsed_seconds || 0;
+  const phaseTimeLimit =
+    currentPhase === "recording"
+      ? recordingConfig.episode_time_s
+      : currentPhase === "resetting"
+      ? recordingConfig.reset_time_s
+      : backendStatus?.phase_time_limit_s || 0;
+
+  const sessionElapsedTime = backendStatus?.session_elapsed_seconds || 0;
+
+  // An ended session we froze on to surface its outcome (see the poll): a real
+  // failure (red) or a cleanup-only warning (amber). `ran_with_warning` must
+  // NOT read as the red failed state — the episodes are safe, only teardown
+  // was noisy (mirrors Inference.tsx).
+  const outcome = backendStatus?.outcome ?? null;
+  const endedWithIssue =
+    !!backendStatus &&
+    !backendStatus.recording_active &&
+    backendStatus.session_ended === true &&
+    (outcome === "failed" || outcome === "ran_with_warning");
+  const endedWarn = endedWithIssue && outcome === "ran_with_warning";
+
+  // The pill's copy. Catalog values are sentence case; the pill uppercases
+  // them via CSS in Latin scripts (see the className below), so no caller ever
+  // concatenates a shouted string.
+  const getStatusText = () => {
+    if (currentPhase === "recording")
+      return t("recording.session.status.recordingEpisode", {
+        index: currentEpisode,
+      });
+    if (currentPhase === "resetting")
+      return isRecordingPaused
+        ? t("recording.session.status.resetPaused")
+        : t("recording.session.status.resetGetReady");
+    if (currentPhase === "naming")
+      return t("recording.session.status.namingEpisode");
+    // Finer "preparing" substeps (and terminal states) the backend now reports
+    // (record.py). These aren't in the Phase-narrowed set that drives the
+    // recording/resetting colors, so read the raw backend string: they render
+    // with the neutral preparing styling below, but the label names which
+    // substep the startup is actually in. The phase strings themselves are
+    // backend enum values — matched on, never displayed.
+    const raw = backendStatus?.current_phase;
+    if (raw === "connecting_robot")
+      return t("recording.session.status.connectingRobot");
+    if (raw === "reconnecting_robot") {
+      const attempt = backendStatus?.connect_retry_attempt;
+      const max = backendStatus?.connect_retry_max;
+      return attempt && max
+        ? t("recording.session.status.reconnectingRetry", { attempt, max })
+        : t("recording.session.status.reconnecting");
+    }
+    if (raw === "connecting_teleop")
+      return t("recording.session.status.connectingTeleop");
+    if (raw === "stopping") return t("recording.session.status.stopping");
+    if (raw === "error") return t("recording.session.status.error");
+    if (currentPhase === "preparing")
+      return backendStatus?.preparation_message || t("recording.session.status.preparing");
+    return t("recording.session.status.complete");
+  };
+
+  const phaseColor =
+    currentPhase === "recording"
+      ? { dot: "bg-red-500", pill: "bg-red-500/15 text-red-600 dark:text-red-300", timer: "text-green-600 dark:text-green-400", bar: "bg-green-500", button: "bg-green-500 hover:bg-green-600" }
+      : currentPhase === "resetting"
+      ? { dot: "bg-orange-500", pill: "bg-orange-500/15 text-orange-600 dark:text-orange-300", timer: "text-orange-600 dark:text-orange-400", bar: "bg-orange-500", button: "bg-orange-500 hover:bg-orange-600" }
+      : { dot: "bg-muted-foreground", pill: "bg-muted text-muted-foreground", timer: "text-muted-foreground", bar: "bg-muted-foreground", button: "bg-muted-foreground" };
+
+  const primaryLabel =
+    currentPhase === "recording"
+      ? t("recording.session.button.endEpisode")
+      : currentPhase === "resetting"
+      ? t("recording.session.button.startNextEpisode")
+      : t("recording.session.button.advance");
+
+  const PrimaryIcon = currentPhase === "recording" ? SkipForward : Play;
+
+  return (
+    <Dialog open>
+      {/* A live-hardware session owns its exits: no X, and ESC / outside
+          clicks never dismiss (ESC instead requests Done via the keyboard
+          handler above). */}
+      <DialogContent
+        hideClose
+        onEscapeKeyDown={(e) => e.preventDefault()}
+        onPointerDownOutside={(e) => e.preventDefault()}
+        onInteractOutside={(e) => e.preventDefault()}
+        className="max-h-[94vh] w-[94vw] max-w-[1200px] gap-0 overflow-y-auto p-4"
+        aria-describedby={undefined}
+      >
+        <DialogTitle className="sr-only">
+          {t("recording.session.dialogTitle")}
+        </DialogTitle>
+
+        {/* Loading state while waiting for the first backend status */}
+        {recordingConfig.per_episode_task && initialTask === null ? (
+          <div className="space-y-4 py-6">
+            <EpisodeTaskPrompt
+              episode={1}
+              defaultTask={recordingConfig.single_task}
+              submitting={false}
+              onSubmit={(task) => {
+                pendingInitialTaskRef.current = task;
+                setInitialTask(task);
+              }}
+            />
+            <Button variant="ghost" onClick={() => onExit()}>
+              {t("common.cancel")}
+            </Button>
+          </div>
+        ) : !backendStatus ? (
+          <div className="flex flex-col items-center justify-center py-16 text-center">
+            <div className="mb-4 h-12 w-12 animate-spin rounded-full border-b-2 border-red-500" />
+            <p className="text-lg">{t("recording.session.connecting")}</p>
+          </div>
+        ) : (
+          <>
+            {/* Two explicit exits, LIVE-only. Once the session has ended these
+                unmount — no control may imply the session is still alive. */}
+            {!sessionEnded && (
+              <div className="mb-3 flex justify-end gap-3">
+                <Button
+                  onClick={requestDone}
+                  disabled={!backendStatus.available_controls.stop_recording}
+                  className="bg-green-600 hover:bg-green-700 text-white flex-shrink-0"
+                >
+                  {t("recording.session.button.done")}
+                </Button>
+                <Button
+                  onClick={requestQuit}
+                  disabled={!backendStatus.available_controls.stop_recording}
+                  variant="outline"
+                  className="border-red-500/50 text-red-600 dark:text-red-300 hover:bg-red-500/10 flex-shrink-0"
+                >
+                  {t("recording.session.button.quit")}
+                </Button>
+              </div>
+            )}
+
+            {!sessionEnded && (
+              <div className="mb-3">
+                <SessionLiveView robot={recordingRobot} recording paused={backendStatus.paused} />
+              </div>
+            )}
+            <div className="bg-card rounded-lg border border-border p-4">
+              {/* Reset the environment and describe the upcoming episode.
+                  Recording waits for the operator; there is no countdown. */}
+              {!sessionEnded && currentPhase === "naming" && (
+                <EpisodeTaskPrompt
+                  key={currentEpisode}
+                  episode={currentEpisode}
+                  defaultTask={
+                    backendStatus.current_episode_task_default ??
+                    recordingConfig.single_task
+                  }
+                  submitting={submittingTask || anyExitDialogOpen}
+                  onSubmit={handleSubmitEpisodeTask}
+                  onRerecord={backendStatus.available_controls.rerecord_episode
+                    ? handleRerecordEpisode : undefined}
+                />
+              )}
+
+              {/* LIVE session chrome: episode HUD, phase pill, timers, Advance.
+                  Replaced wholesale by the end-state UI once the session ends. */}
+              {!sessionEnded && currentPhase !== "naming" && (
+                <>
+                  <div className="flex justify-end items-center gap-4 mb-2 text-sm text-muted-foreground">
+                    <span
+                      aria-label={t(
+                        "recording.session.hud.episodeCounterLabel",
+                        { index: currentEpisode, total: totalEpisodes },
+                      )}
+                    >
+                      {/* <1> wraps the emphasised episode number. */}
+                      <Trans
+                        i18nKey="recording.session.hud.episodeCounter"
+                        values={{ index: currentEpisode, total: totalEpisodes }}
+                        components={[
+                          <span key="0" />,
+                          <span key="1" className="text-foreground font-semibold" />,
+                        ]}
+                      />
+                    </span>
+                    <span
+                      className="font-mono"
+                      aria-label={t("recording.session.hud.sessionTimeLabel", {
+                        // Pre-formatted mm:ss — no locale-aware formatting here.
+                        time: formatTime(sessionElapsedTime),
+                      })}
+                    >
+                      {formatTime(sessionElapsedTime)}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={toggleMute}
+                      aria-label={
+                        muted
+                          ? t("recording.session.hud.unmute")
+                          : t("recording.session.hud.mute")
+                      }
+                      className="h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted"
+                    >
+                      {muted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+                    </Button>
+                  </div>
+
+                  <div className="text-center mb-2">
+                    <div
+                      role="status"
+                      aria-live="polite"
+                      className={cn(
+                        "inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold",
+                        // `uppercase` is a no-op on Chinese but the tracking is
+                        // not — both come off together so the pill doesn't
+                        // render over-spaced.
+                        isCJK ? "" : "uppercase tracking-widest",
+                        phaseColor.pill,
+                      )}
+                    >
+                      <span className={`w-2 h-2 rounded-full ${phaseColor.dot} ${currentPhase !== "completed" ? "animate-pulse" : ""}`} />
+                      {getStatusText()}
+                    </div>
+                  </div>
+
+                  <div className="text-center mb-4">
+                    <div className={`text-4xl font-mono font-bold leading-none ${phaseColor.timer}`}>
+                      {formatTime(phaseElapsedTime)}
+                    </div>
+                    <div className="text-sm text-muted-foreground mt-2">
+                      / {formatTime(phaseTimeLimit)}
+                    </div>
+                  </div>
+
+                  <div className="w-full bg-muted rounded-full h-1.5 mb-3">
+                    <div
+                      className={`h-1.5 rounded-full transition-all duration-500 ${phaseColor.bar}`}
+                      style={{
+                        width: `${Math.min((phaseElapsedTime / phaseTimeLimit) * 100, 100)}%`,
+                      }}
+                    />
+                  </div>
+
+                  {/* Primary advance full-width on its own row, with Pause and
+                      Re-record sharing a secondary row below — keeps the row
+                      count fixed at two-per-line regardless of how many
+                      secondary controls are visible, so it can never overflow
+                      the dialog width the way a single three-across row did.
+                      Retaking a bad take is a first-class action during
+                      collection, not a hidden menu item; ENTER mirrors Pause,
+                      DELETE/Backspace mirrors Re-record (see the keydown
+                      handler note). */}
+                  <div className="flex flex-col gap-3">
+                    <Button
+                      onClick={handleExitEarly}
+                      disabled={
+                        !backendStatus.available_controls.exit_early ||
+                        optimisticPhase !== null ||
+                        currentPhase === "completed"
+                      }
+                      className={`w-full text-white font-semibold py-6 text-lg disabled:opacity-50 ${phaseColor.button}`}
+                    >
+                      <PrimaryIcon className="w-5 h-5 mr-2" />
+                      {primaryLabel}
+                      {/* Key legends, not copy: SPACE / ENTER / DEL are the
+                          labels printed on the physical keyboard, so they read
+                          the same in every language. */}
+                      {currentPhase !== "completed" && (
+                        <span className="ml-3 px-2 py-0.5 rounded text-xs font-mono bg-white/20 text-white/90">SPACE / →</span>
+                      )}
+                    </Button>
+                    <div className="flex gap-3">
+                      {!recordingConfig.per_episode_task && (currentPhase === "recording" || currentPhase === "resetting") && (
+                        <Button
+                          onClick={isPauseActive ? handleResumeRecording : handlePauseRecording}
+                          disabled={
+                            (isPauseActive
+                              ? !backendStatus.available_controls.resume_recording
+                              : !backendStatus.available_controls.pause_recording) ||
+                            optimisticPaused !== null
+                          }
+                          variant="outline"
+                          className="flex-1 py-4 text-base font-semibold border-border bg-transparent text-foreground hover:bg-muted disabled:opacity-50"
+                        >
+                          {isPauseActive ? (
+                            <Play className="w-4 h-4 mr-2" />
+                          ) : (
+                            <Pause className="w-4 h-4 mr-2" />
+                          )}
+                          {isPauseActive
+                            ? t("recording.session.button.resume")
+                            : t("recording.session.button.pause")}
+                          <span className="ml-3 px-2 py-0.5 rounded text-xs font-mono bg-muted text-muted-foreground">ENTER</span>
+                        </Button>
+                      )}
+                      <Button
+                        onClick={handleRerecordEpisode}
+                        disabled={!backendStatus.available_controls.rerecord_episode}
+                        variant="outline"
+                        className="flex-1 py-4 text-base font-semibold border-border bg-transparent text-foreground hover:bg-muted disabled:opacity-50"
+                      >
+                        <RotateCcw className="w-4 h-4 mr-2" />
+                        {t("recording.session.button.rerecord")}
+                        <span className="ml-3 px-2 py-0.5 rounded text-xs font-mono bg-muted text-muted-foreground">DEL</span>
+                      </Button>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* END-STATE UI. A clean finish auto-exits with the handoff (see
+                  the poll); this text covers the brief window before that fires. */}
+              {sessionEnded && !endedWithIssue && (
+                <p className="text-center text-sm text-muted-foreground">
+                  {t("recording.session.ended.complete")}
+                </p>
+              )}
+
+              {endedWithIssue && (() => {
+                const savedEpisodes = backendStatus.saved_episodes ?? 0;
+                const keptSomething = savedEpisodes > 0 && !backendStatus.discarded_empty;
+                return (
+                  <div
+                    className={`rounded-lg border p-4 ${
+                      endedWarn
+                        ? "border-amber-500/40 bg-amber-500/10"
+                        : "border-red-500/40 bg-red-500/10"
+                    }`}
+                  >
+                    <div
+                      className={`flex items-center gap-2 text-sm font-semibold ${
+                        endedWarn
+                          ? "text-amber-600 dark:text-amber-300"
+                          : "text-red-600 dark:text-red-300"
+                      }`}
+                    >
+                      <span
+                        className={`w-2 h-2 rounded-full ${
+                          endedWarn ? "bg-amber-500" : "bg-red-500"
+                        }`}
+                      />
+                      {endedWarn
+                        ? t("recording.session.ended.warnTitle")
+                        : t("recording.session.ended.failedTitle")}
+                    </div>
+                    {backendStatus.hint && (
+                      <p
+                        className={`mt-2 text-sm leading-relaxed ${
+                          endedWarn
+                            ? "text-amber-700 dark:text-amber-100/90"
+                            : "text-red-700 dark:text-red-100/90"
+                        }`}
+                      >
+                        {backendStatus.hint}
+                      </p>
+                    )}
+                    {backendStatus.error && (
+                      <pre className="mt-3 max-h-40 overflow-auto rounded bg-muted p-2 text-xs text-muted-foreground whitespace-pre-wrap break-words">
+                        {backendStatus.error}
+                      </pre>
+                    )}
+                    <div className="mt-4 flex flex-col gap-2">
+                      {/* The only path off this screen. When something was
+                          saved, this opens the Finalize review, where
+                          keep/delete is a per-episode choice instead of a
+                          blind all-or-nothing fork. When nothing was saved
+                          (discarded_empty), the SAME handler's payload takes
+                          this straight to the empty-handoff banner instead —
+                          there's nothing to review. */}
+                      <Button
+                        onClick={reviewAndFinalize}
+                        className="w-full font-semibold"
+                      >
+                        {keptSomething
+                          ? t("recording.session.button.reviewAndFinalize")
+                          : t("recording.session.button.continue")}
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+
+            <div className="mt-6">
+              {/* LogPanel takes an already-translated title. */}
+              <LogPanel
+                logs={logs}
+                title={t("recording.log.title")}
+                defaultCollapsed
+              />
+            </div>
+          </>
+        )}
+
+        <AlertDialog open={showDoneConfirm} onOpenChange={setShowDoneConfirm}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{doneConfirmCopy(t).title}</AlertDialogTitle>
+              <AlertDialogDescription>
+                {doneConfirmCopy(t).description}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>
+                {t("recording.exit.keepRecording")}
+              </AlertDialogCancel>
+              <AlertDialogAction
+                onClick={confirmDone}
+                className="bg-green-600 hover:bg-green-700 text-white"
+              >
+                {t("recording.session.button.done")}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        <AlertDialog open={showQuitConfirm} onOpenChange={setShowQuitConfirm}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {quitConfirmCopy(t, resume).title}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {quitConfirmCopy(t, resume).description}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>
+                {t("recording.exit.keepRecording")}
+              </AlertDialogCancel>
+              <AlertDialogAction
+                onClick={confirmQuit}
+                className="bg-red-500 hover:bg-red-600 text-white"
+              >
+                {t("recording.exit.quit.confirm")}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </DialogContent>
+    </Dialog>
+  );
+};
+
+export default RecordingSessionDialog;

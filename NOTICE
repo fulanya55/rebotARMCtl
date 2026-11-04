@@ -1,0 +1,21 @@
+rebotARMCtl
+Copyright 2026 fulanya
+
+This product includes software and hardware descriptions from other projects.
+
+MakerMods Lab (apps/lab)
+  Copyright 2026 MakerMods; portions Copyright The HuggingFace Inc. team.
+  Licensed under the Apache License, Version 2.0. See apps/lab/LICENSE.
+  Source: https://github.com/makermods-robotics/makermodslab at e377149.
+  Modified: added the controller arm family, controller API routes and pages.
+
+EVA-Client (packages/rac-policy, adapted files are marked in their headers)
+  Licensed under the Apache License, Version 2.0.
+  Source: https://github.com/Noietch/EVA-CLIENT at 926cdf4.
+
+reBot Arm B601-RS description (assets/robots/rebot_b601_rs)
+  Copyright Seeed Studio and contributors.
+  Licensed under CERN-OHL-W-2.0. See assets/robots/rebot_b601_rs/LICENSE.CERN-OHL-W-2.0.
+  Source: https://github.com/Seeed-Projects/reBot-DevArm at 5265303.
+
+See docs/LICENSE_AUDIT.md for what each upstream project contributes and how.

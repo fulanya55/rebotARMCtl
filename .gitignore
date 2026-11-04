@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+wheels/
+
+# Frontend
+node_modules/
+apps/lab/frontend/dist/
+
+# Firmware and toolchains
+firmware/build/
+firmware/third_party/
+.tools/
+
+# KiCad transient files
+*-backups/
+fp-info-cache
+*.kicad_prl
+_autosave-*
+~*.lck
+~$*
+
+# Local runtime data and downloaded robot meshes without a redistribution grant
+.rac/
+outputs/
+assets/robots/star_arm_102/upstream/
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

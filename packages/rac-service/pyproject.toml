@@ -1,0 +1,17 @@
+[project]
+name = "rac-service"
+version = "0.1.0"
+description = "Controller Service: the single owner of the controller USB link"
+requires-python = ">=3.12,<3.14"
+license = "Apache-2.0"
+dependencies = ["rac-link", "numpy>=1.26", "msgpack>=1.0"]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rac_service"]
+
+[tool.uv.sources]
+rac-link = { workspace = true }

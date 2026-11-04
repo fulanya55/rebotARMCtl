@@ -1,0 +1,212 @@
+import React from "react";
+import { useTranslation } from "react-i18next";
+import { AlertTriangle, ChevronDown } from "lucide-react";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { cn } from "@/lib/utils";
+
+import { useEyebrowClass } from "@/hooks/useEyebrowClass";
+
+// Re-exported from its neutral home so the many existing
+// `from "@/components/studio/panel/primitives"` imports keep working.
+export { useEyebrowClass };
+
+/** Slide animation shared by every studio collapsible — the panels' entry
+ * forms and all three libraries. The single home for this animation string;
+ * don't copy it into components. */
+export const SLIDE =
+  "overflow-hidden data-[state=open]:animate-collapsible-down data-[state=closed]:animate-collapsible-up";
+
+/** Numbered studio panel header: mono step digit + title, identical across
+ * Collect, Train, and Deploy. */
+export const PanelHeader: React.FC<{
+  step: string;
+  title: string;
+  /** Optional trailing element (e.g. a resolving spinner). */
+  children?: React.ReactNode;
+  /** Onboarding tour anchor — a normal-sized element to spotlight, instead of
+   * the full-height panel section (which leaves the Popover callout with no
+   * room to render within the viewport). */
+  dataTour?: string;
+}> = ({ step, title, children, dataTour }) => (
+  <div className="flex items-baseline gap-2" data-tour={dataTour}>
+    <span className="font-mono text-xs text-muted-foreground">{step}</span>
+    <h2 className="text-base">{title}</h2>
+    {children}
+  </div>
+);
+
+/**
+ * The skin every panel's entry control wears. Exported separately because
+ * Deploy's entry is a real <Select> (picking a policy IS the value, it doesn't
+ * just open a form), so its SelectTrigger has to wear this rather than render
+ * a PanelEntryControl.
+ */
+export const PANEL_ENTRY_CLASS =
+  "flex h-10 w-full items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background transition-colors hover:border-muted-foreground/40 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2";
+
+/** The dot accent each panel's entry control carries, so the three openers are
+ * distinguishable at a glance while sharing one shape. */
+export const PanelEntryDot: React.FC<{ className: string }> = ({
+  className,
+}) => (
+  <span
+    aria-hidden
+    className={cn("h-2 w-2 shrink-0 rounded-full", className)}
+  />
+);
+
+/**
+ * The panels' shared entry control — a quiet select-style row (same height,
+ * border, and radius as a shadcn SelectTrigger) so Collect's "Record new
+ * dataset", Train's "Start a new training", and Deploy's real policy <Select>
+ * read as the same control. Used as a CollapsibleTrigger (asChild) that
+ * slides the panel's form open in place.
+ */
+export const PanelEntryControl = React.forwardRef<
+  HTMLButtonElement,
+  React.ButtonHTMLAttributes<HTMLButtonElement> & {
+    open: boolean;
+    /** Tiny status-dot accent (e.g. bg-red-500 for record). */
+    dotClassName?: string;
+  }
+>(({ open, dotClassName, children, className, ...props }, ref) => (
+  <button
+    ref={ref}
+    type="button"
+    className={cn(PANEL_ENTRY_CLASS, className)}
+    {...props}
+  >
+    {dotClassName ? <PanelEntryDot className={dotClassName} /> : null}
+    <span className="truncate">{children}</span>
+    <ChevronDown
+      className={cn(
+        "ml-auto h-4 w-4 shrink-0 text-muted-foreground transition-transform",
+        open && "rotate-180",
+      )}
+    />
+  </button>
+));
+PanelEntryControl.displayName = "PanelEntryControl";
+
+/**
+ * An eyebrow-headed block inside a panel form. Per the studio's copy rule the
+ * eyebrow level is reserved for blocks that are NOT a single labelled control
+ * — in practice Cameras and Advanced. Everything else is just <Label> +
+ * control, so a category heading never sits directly above one field and
+ * restates it.
+ */
+export const FormSection: React.FC<{
+  title: string;
+  className?: string;
+  children: React.ReactNode;
+}> = ({ title, className, children }) => {
+  const eyebrow = useEyebrowClass();
+  return (
+    <section className={cn("space-y-3", className)}>
+      <h3 className={eyebrow}>{title}</h3>
+      {children}
+    </section>
+  );
+};
+
+/**
+ * The one "Advanced parameters" collapsible, shared by the Collect form and
+ * the training configurator. Its trigger is an `.eyebrow` so it sits at the
+ * same level as FormSection instead of outranking it — the previous
+ * `text-sm font-semibold` triggers were visually heavier than the category
+ * headings above them, inverting the hierarchy.
+ *
+ * Uncontrolled by default; pass open/onOpenChange to drive it.
+ */
+export const AdvancedSection: React.FC<{
+  /** Omit for "Advanced parameters" — the label used in every panel. Left
+   * optional (rather than made required) so the default stays in ONE place;
+   * it is resolved below at render time, never as a prop default, which would
+   * freeze the copy at whatever language happened to load first. */
+  title?: string;
+  /** One line naming what's inside, so the block is skippable unopened. */
+  summary?: React.ReactNode;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  children: React.ReactNode;
+}> = ({ title, summary, open, onOpenChange, children }) => {
+  const { t } = useTranslation();
+  const eyebrow = useEyebrowClass();
+  return (
+    <Collapsible
+      open={open}
+      onOpenChange={onOpenChange}
+      className="group space-y-3"
+    >
+      <CollapsibleTrigger className="flex w-full items-start justify-between border-b border-border pb-2 text-left">
+        <span>
+          <span className={cn(eyebrow, "block")}>
+            {title ?? t("studio.common.advancedParameters")}
+          </span>
+          {summary ? (
+            <span className="mt-1 block text-xs text-muted-foreground">
+              {summary}
+            </span>
+          ) : null}
+        </span>
+        <ChevronDown className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
+      </CollapsibleTrigger>
+      <CollapsibleContent className={SLIDE}>
+        <div className="space-y-4 pt-1">{children}</div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+};
+
+/**
+ * The robot-readiness warning that opens the Collect and Deploy forms. One
+ * implementation of a block the two panels used to render differently (Collect
+ * hand-rolled amber divs, Deploy used <Alert> with warn tokens) — the caller
+ * owns the copy, this owns the look. Warnings only: a ready robot renders
+ * nothing, because the robot menu already names the selection and a green
+ * "ready" line just restates it. Rendered without an eyebrow: it reports
+ * state, it isn't a parameter.
+ */
+export const RobotStatus: React.FC<{
+  ready: boolean;
+  children: React.ReactNode;
+}> = ({ ready, children }) =>
+  ready ? null : (
+    <Alert className="border-warn/40 text-warn [&>svg]:text-warn">
+      <AlertTriangle className="h-4 w-4" />
+      <AlertDescription>{children}</AlertDescription>
+    </Alert>
+  );
+
+/**
+ * A panel's library, behind a hairline: it starts right after the panel's
+ * action row at the normal gap and STRETCHES to the foot of the column.
+ *
+ * Not `mt-auto` (which pushed the whole block down and left the slack as a gap
+ * above the rule) and not content-height either — `flex-1` in a `min-h-0`
+ * column, so the free space lands INSIDE the library, between its cards and
+ * its "Show all" footer, and the three columns' footers line up because they
+ * all end at the same place. `min-h-0` is what lets it shrink when a panel's
+ * form is open; below the grid's own min height the column scrolls instead.
+ *
+ * Every wrapper between this and the scrolling card viewport has to repeat
+ * `flex min-h-0 flex-1 flex-col`, or the height stops being handed down.
+ */
+export const LibrarySection: React.FC<{
+  className?: string;
+  children: React.ReactNode;
+}> = ({ className, children }) => (
+  <div
+    className={cn(
+      "flex min-h-0 flex-1 flex-col border-t border-border pt-5",
+      className,
+    )}
+  >
+    {children}
+  </div>
+);

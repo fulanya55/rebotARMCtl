@@ -1,0 +1,1364 @@
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useTranslation } from "react-i18next";
+import {
+  Boxes,
+  Check,
+  Loader2,
+  Pause,
+  Play,
+  SkipBack,
+  SkipForward,
+  Trash2,
+  VideoOff,
+} from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { useStudio } from "@/contexts/StudioContext";
+import { useSelectedDataset } from "@/hooks/useSelectedDataset";
+import { useApi } from "@/contexts/ApiContext";
+import { useToast } from "@/hooks/use-toast";
+import { useLanguage } from "@/contexts/LanguageContext";
+import { isCaselessScript } from "@/i18n/config";
+import { cn } from "@/lib/utils";
+import { lastFramePosition, previewPosition } from "@/lib/episodePreview";
+import { resolveDeleteAction } from "@/lib/deleteSemantics";
+import DatasetInfoCard from "@/components/landing/DatasetInfoCard";
+import JointPositionChart from "@/components/dialogs/JointPositionChart";
+import EpisodeReplayPanel from "@/components/dialogs/EpisodeReplayPanel";
+import {
+  DatasetItem,
+  EpisodeJointSeries,
+  EpisodeSummary,
+  deleteDataset,
+  deleteEpisodes,
+  episodeVideoUrl,
+  getDatasetInfo,
+  getEpisodeJoints,
+  getExcludedEpisodes,
+  hideDataset,
+  listEpisodes,
+  removeCustomDataset,
+  setExcludedEpisodes,
+} from "@/lib/replayApi";
+import { ApiError } from "@/lib/apiClient";
+
+// The backend's own message for a rejected request (the 409 detail from
+// episode-delete, say), or null when the failure carried none. Server prose
+// renders in English in every language — the call site supplies the translated
+// fallback beside it.
+function backendDetail(e: unknown): string | null {
+  return e instanceof ApiError && e.detail ? e.detail : null;
+}
+
+export interface DatasetDetailDialogProps {
+  repoId: string | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** Called when an action navigates to the studio, so a parent surface that
+   * would otherwise cover the studio (e.g. the library sheet) can close too. */
+  onStudioAction?: () => void;
+  /** Called when the whole dataset is removed from local disk (the info
+   * card's delete action, or a Finalize review that deletes every remaining
+   * episode) so a parent list (LibrarySheet, CollectPanel) can refresh. */
+  onDeleted?: () => void;
+  /** The listing row for this dataset, when the caller already has one
+   * (LibrarySheet, DatasetPicker). Enables the whole-dataset delete
+   * affordance on the info card (resolveDeleteAction needs `source` to know
+   * whether that's a destructive local delete or just removing a local
+   * copy) — omitted, the affordance stays hidden, same as before. */
+  item?: DatasetItem;
+  /** Post-recording review mode (set by CollectPanel right after a session
+   * ends, clean finish or error alike). While set: the dialog can't be
+   * dismissed by ESC / outside-click / close button, every episode tile shows
+   * a keep/discard checkbox (all checked by default), and the footer shows
+   * Finalize instead of Train. Clicking Finalize permanently deletes every
+   * UNCHECKED episode, then calls `onFinalize` — or, if every episode was
+   * unchecked, deletes the whole dataset and calls `onDiscarded` instead
+   * (there is nothing left to finalize). The training-curation toggle and the
+   * info card's own delete affordance are hidden while this is set — both
+   * would be redundant with (or conflict with) the checkboxes here. A
+   * secondary "keep all episodes and close" action always exits through
+   * `onFinalize` without deleting anything, so a failed episode load can
+   * never leave the user with a page reload as the only way out (a reload
+   * would drop the pending Hub push). */
+  finalize?: {
+    onFinalize: () => void;
+    onDiscarded: () => void;
+  };
+}
+
+// Best (cols, tileW, tileH) for `n` tiles inside a box of `boxW` x `boxH`:
+// the search over column counts that a video-gallery layout needs so the
+// camera grid keeps growing/reflowing as cameras are added or the window is
+// resized, instead of a fixed N-up template.
+function computeCameraLayout(
+  n: number,
+  boxW: number,
+  boxH: number,
+  gap = 8,
+  aspect = 16 / 10,
+) {
+  let best = { cols: 1, tileW: boxW, tileH: boxW / aspect };
+  let bestArea = -1;
+  for (let cols = 1; cols <= n; cols++) {
+    const rows = Math.ceil(n / cols);
+    const cellW = (boxW - gap * (cols - 1)) / cols;
+    const cellH = (boxH - gap * (rows - 1)) / rows;
+    let tileW = cellW;
+    let tileH = tileW / aspect;
+    if (tileH > cellH) {
+      tileH = cellH;
+      tileW = tileH * aspect;
+    }
+    const area = tileW * tileH;
+    if (area > bestArea) {
+      bestArea = area;
+      best = { cols, tileW, tileH };
+    }
+  }
+  return best;
+}
+
+const fmtTime = (t: number) => `${t.toFixed(1)}s`;
+
+/**
+ * Episode viewer: a growable grid of camera feeds (one per dataset camera —
+ * reflows on resize and as camera count changes, never a fixed 2-up) with
+ * transport controls and a joint-position chart synced to the playhead. Real
+ * <video> elements pointing at /datasets/episode-video (Range-request backed,
+ * so scrubbing seeks without buffering the whole file); no local data means no
+ * episode list, so this renders a locked "not viewable yet" state instead.
+ */
+const EpisodeViewer: React.FC<{
+  repoId: string;
+  cameras: string[];
+  episodes: EpisodeSummary[];
+  selectedEpisode: number;
+  onSelectEpisode: (episodeIndex: number) => void;
+}> = ({ repoId, cameras, episodes, selectedEpisode, onSelectEpisode }) => {
+  const { t } = useTranslation();
+  const { baseUrl, fetchWithHeaders } = useApi();
+  const [joints, setJoints] = useState<EpisodeJointSeries | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [videoErrors, setVideoErrors] = useState<Record<string, boolean>>({});
+  // True while the viewer sits at `previewT` and the user hasn't chosen a
+  // position yet — pressing play rewinds to the episode's real start rather
+  // than resuming from the preview frame, so the first half-second is never
+  // skipped. Cleared by an explicit scrub, and by the first play.
+  const [parkedAtPreview, setParkedAtPreview] = useState(true);
+  // True once playback has reached this episode's end and auto-stopped, so
+  // the next play restarts the episode instead of resuming. Explicit state
+  // rather than comparing currentTime against the end: the corrective seek in
+  // handlePrimaryTimeUpdate fires a timeupdate carrying the frame's ACTUAL
+  // presentation time, and a seek resolves to the frame at-or-before its
+  // target — so that value can land just under any threshold, leaving a
+  // float comparison reading "not at the end" and replay silently resuming
+  // for a single frame instead of restarting.
+  const [atEpisodeEnd, setAtEpisodeEnd] = useState(false);
+
+  const episode = episodes.find((e) => e.episode_index === selectedEpisode) ?? null;
+  const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
+  // The camera whose onTimeUpdate drives currentTime/the end-of-episode
+  // boundary check. Falls back off cameras[0] onto the next camera that
+  // hasn't errored — if the "primary" camera fails to decode, its <video>
+  // element is replaced by an error placeholder and never fires
+  // onTimeUpdate, so pinning this to a fixed index would silently stall
+  // playback tracking (auto-pause, the loop-to-start fix, the scrubber)
+  // for the rest of the session.
+  const primaryCamera = cameras.find((c) => !videoErrors[c]) ?? cameras[0];
+  // v3.0 packs consecutive episodes into the same physical mp4 per camera —
+  // this episode's slice starts at `from` within that (possibly shared)
+  // file, not at 0. Every seek/play/boundary check goes through this.
+  const offsetFor = useCallback(
+    (camera: string) => episode?.video_offsets?.[camera]?.from ?? 0,
+    [episode],
+  );
+  // Positions within this episode's slice of the packed v3.0 mp4. The
+  // geometry — and why neither one is the episode's exact start or end — is
+  // documented in lib/episodePreview.ts.
+  const previewT = episode ? previewPosition(episode.duration) : 0;
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setJoints(null);
+    getEpisodeJoints(baseUrl, fetchWithHeaders, repoId, selectedEpisode, controller.signal)
+      .then(setJoints)
+      .catch(() => {
+        if (!controller.signal.aborted) setJoints(null);
+      });
+    return () => controller.abort();
+  }, [baseUrl, fetchWithHeaders, repoId, selectedEpisode]);
+
+  // Warm the backend's cache for the NEXT episode while this one plays, so
+  // advancing often lands on an already-fetched chunk instead of repeating
+  // the same first-time delay (see docs/superpowers/specs/2026-07-24-episode-
+  // prefetch-design.md). A 1-byte Range request drives get_episode_video_path
+  // all the way through — including a Hub hf_hub_download fetch for a
+  // not-yet-cached chunk — without downloading video the user hasn't asked
+  // for yet; FileResponse already supports Range requests (it's how the real
+  // <video> tag seeks). The joints response is discarded — its fetch alone is
+  // what warms the data chunk server-side. Best-effort: any failure here has
+  // zero effect on the real fetch that runs when the user actually navigates
+  // there, so errors are silently swallowed.
+  useEffect(() => {
+    const next = episodes[episodes.findIndex((e) => e.episode_index === selectedEpisode) + 1];
+    if (!next) return;
+    const controller = new AbortController();
+    // Debounced: don't kick off a prefetch until the user has settled on
+    // this episode for a moment. Without this, rapid navigation (arrow-key
+    // taps, clicking through the list) fires — and immediately abandons via
+    // the abort below — a prefetch for every episode passed through on the
+    // way to wherever the user actually stops. The frontend abort doesn't
+    // necessarily cancel an in-flight Hub download the backend already
+    // started, so an unthrottled burst can leave several abandoned
+    // hf_hub_download calls running server-side.
+    const timer = window.setTimeout(() => {
+      for (const camera of cameras) {
+        fetchWithHeaders(episodeVideoUrl(baseUrl, repoId, next.episode_index, camera), {
+          headers: { Range: "bytes=0-0" },
+          signal: controller.signal,
+        }).catch(() => {});
+      }
+      getEpisodeJoints(baseUrl, fetchWithHeaders, repoId, next.episode_index, controller.signal).catch(() => {});
+    }, 400);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [baseUrl, fetchWithHeaders, repoId, episodes, cameras, selectedEpisode]);
+
+  useEffect(() => {
+    setPlaying(false);
+    setParkedAtPreview(true);
+    setAtEpisodeEnd(false);
+    setCurrentTime(0);
+    setVideoErrors({});
+  }, [selectedEpisode]);
+
+  const forEachVideo = useCallback((fn: (v: HTMLVideoElement) => void) => {
+    Object.values(videoRefs.current).forEach((v) => v && fn(v));
+  }, []);
+
+  const handlePlayPause = useCallback(() => {
+    if (playing) {
+      forEachVideo((v) => v.pause());
+      setPlaying(false);
+    } else {
+      // Rewind to this episode's real start before playing, in two cases.
+      //
+      // Parked at the preview frame: that position is half a second in (see
+      // previewT), and playing from there would silently skip the opening of
+      // every episode.
+      //
+      // Parked at (or past) the episode's own end: the underlying mp4 keeps
+      // going into the next episode's frames past this point (see the
+      // v3.0-packing note on offsetFor above), so resuming here would spill
+      // into that footage before the boundary check in
+      // handlePrimaryTimeUpdate catches up. Loop back to this episode's
+      // start instead.
+      // `atEpisodeEnd` covers auto-stop; the position test covers arriving
+      // at the end by scrubbing, which clears both flags. Without it, play
+      // from a fully-right scrubber runs forward into the NEXT episode's
+      // packed footage until the ~4Hz boundary check catches up.
+      const atEnd =
+        episode && currentTime >= lastFramePosition(episode.length, episode.duration);
+      if (episode && (parkedAtPreview || atEpisodeEnd || atEnd)) {
+        for (const [camera, v] of Object.entries(videoRefs.current)) {
+          if (v) v.currentTime = offsetFor(camera);
+        }
+        setCurrentTime(0);
+      }
+      setParkedAtPreview(false);
+      setAtEpisodeEnd(false);
+      forEachVideo((v) => {
+        v.play().catch(() => {});
+      });
+      setPlaying(true);
+    }
+  }, [playing, forEachVideo, episode, currentTime, offsetFor, parkedAtPreview, atEpisodeEnd]);
+
+  // Drives currentTime/scrubber from the primary camera's raw (file-relative)
+  // playback position, and is the one place that notices the episode's own
+  // slice has ended — native `ended` usually doesn't fire here since the
+  // underlying file usually keeps going into the next episode's frames.
+  const handlePrimaryTimeUpdate = (rawTime: number) => {
+    if (!episode) return;
+    // Parked at the preview frame: the seek that painted it fires a
+    // timeupdate at previewT, but the scrubber must keep reading 0 — that is
+    // where play actually begins (handlePlayPause rewinds to the episode's
+    // start). Reporting 0.5s here would misstate where playback would resume,
+    // and drag the joint chart's cursor off the episode's start with it.
+    // Also frozen once the episode has ended: the corrective seek below fires
+    // a further timeupdate, and letting it through would drag the scrubber
+    // back off the end it just settled on.
+    if (parkedAtPreview || atEpisodeEnd) return;
+    const offset = offsetFor(primaryCamera);
+    const t = Math.max(0, Math.min(episode.duration, rawTime - offset));
+    setCurrentTime(t);
+    // `timeupdate` only fires at roughly 4Hz, so by the time this notices the
+    // episode is over, playback has already run up to ~250ms — several
+    // frames — into the NEXT episode's footage, and pausing here would freeze
+    // the viewer on a frame that isn't this episode's. Pause, then snap back
+    // onto this episode's final frame. The target is that frame's own
+    // timestamp: a boundary, so an engine may resolve it to the last or
+    // second-to-last frame, and both are inside this episode — which is the
+    // only property that matters here.
+    // `playing` gates the snap so it can't re-trigger itself: the seek below
+    // fires another timeupdate that is still past the threshold, and without
+    // this the handler would re-pause and re-seek on every one of them.
+    if (playing && rawTime >= offset + lastFramePosition(episode.length, episode.duration)) {
+      forEachVideo((v) => v.pause());
+      for (const [camera, v] of Object.entries(videoRefs.current)) {
+        if (v) v.currentTime =
+          offsetFor(camera) + lastFramePosition(episode.length, episode.duration);
+      }
+      setCurrentTime(episode.duration);
+      setPlaying(false);
+      setAtEpisodeEnd(true);
+    }
+  };
+
+  // Fallback for the (possible) case where this episode's slice is the
+  // physical file's own end — e.g. the last episode in a chunk — and the
+  // video's real duration falls short of `episode.duration` (independently
+  // derived from length/fps, not from the file itself). Native `ended` fires
+  // here before the timeupdate threshold above ever would, and without this
+  // handler `playing` would stay stuck true forever since no further
+  // timeupdate events arrive once playback has actually stopped.
+  const handlePrimaryEnded = () => {
+    forEachVideo((v) => v.pause());
+    setPlaying(false);
+    // Same contract as the boundary check above — however playback stopped,
+    // the next play restarts the episode rather than resuming from the end,
+    // and the transport settles at the end rather than wherever the last
+    // ~4Hz timeupdate happened to land (which reads as "12.7 / 12.9" with the
+    // scrubber and joint cursor stuck short of the end).
+    setCurrentTime(episode?.duration ?? 0);
+    setAtEpisodeEnd(true);
+  };
+
+  const handleSeek = (t: number) => {
+    // Clamped to the last frame, not to `duration`: `duration` IS the
+    // boundary shared with the next episode, so dragging the scrubber fully
+    // right would land on the same coin-flip seek that episodePreview.ts
+    // exists to keep the viewer off.
+    const end = episode ? lastFramePosition(episode.length, episode.duration) : 0;
+    const clamped = Math.max(0, Math.min(end, t));
+    setParkedAtPreview(false);
+    setAtEpisodeEnd(false);
+    for (const [camera, v] of Object.entries(videoRefs.current)) {
+      if (v) v.currentTime = offsetFor(camera) + clamped;
+    }
+    setCurrentTime(clamped);
+  };
+
+  const gridWrapRef = useRef<HTMLDivElement>(null);
+  const [layout, setLayout] = useState({ cols: 1, tileW: 100, tileH: 60 });
+  useEffect(() => {
+    const el = gridWrapRef.current;
+    if (!el) return;
+    const recompute = () => {
+      const rect = el.getBoundingClientRect();
+      setLayout(
+        computeCameraLayout(
+          Math.max(1, cameras.length),
+          Math.max(80, rect.width - 16),
+          Math.max(80, rect.height - 16),
+        ),
+      );
+    };
+    recompute();
+    const ro = new ResizeObserver(recompute);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [cameras.length]);
+
+  const scrubFrac = episode?.duration ? currentTime / episode.duration : 0;
+
+  const scrubRef = useRef<HTMLDivElement>(null);
+  const draggingRef = useRef(false);
+  const seekFromClientX = (clientX: number) => {
+    const rect = scrubRef.current?.getBoundingClientRect();
+    if (!rect || !episode) return;
+    const frac = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    handleSeek(frac * episode.duration);
+  };
+
+  const gotoEpisode = useCallback(
+    (delta: number) => {
+      const i = episodes.findIndex((e) => e.episode_index === selectedEpisode);
+      const next = episodes[i + delta];
+      if (next) onSelectEpisode(next.episode_index);
+    },
+    [episodes, selectedEpisode, onSelectEpisode],
+  );
+
+  const currentIndex = episodes.findIndex((e) => e.episode_index === selectedEpisode);
+  const hasPrev = currentIndex > 0;
+  const hasNext = currentIndex >= 0 && currentIndex < episodes.length - 1;
+
+  // Mirrors the guarded-window-listener convention in RecordingSessionDialog:
+  // skip when a text field has focus (the info-card tag input in the side
+  // panel), preventDefault on the keys we do handle so Space doesn't scroll
+  // the page or double-fire a focused button's native click.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      // Ignore OS auto-repeat from a held key — holding Space shouldn't
+      // rapid-toggle play/pause, and holding an arrow shouldn't blow through
+      // the episode list faster than an actual keypress.
+      if (e.repeat) return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+        return;
+      }
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        gotoEpisode(-1);
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        gotoEpisode(1);
+      } else if (e.key === " " || e.code === "Space") {
+        // A focused button already activates on Space natively, and its
+        // onClick calls the same handler we'd call here (Prev/Play/Next/
+        // episode rows) — don't hijack that, or tabbing to any button in
+        // this dialog would silently turn Space into a play/pause toggle
+        // instead of activating the focused control.
+        if (target && target.tagName === "BUTTON") return;
+        e.preventDefault();
+        handlePlayPause();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [gotoEpisode, handlePlayPause]);
+
+  // Drives the chart's scrubFrac from the replay's own local elapsed-time
+  // clock while a hardware replay is playing — the same prop that camera
+  // playback drives via currentTime, just a different clock source. Reset
+  // to null (falls back to the camera-driven currentTime) once the replay
+  // leaves the "playing" phase.
+  const [replayElapsedS, setReplayElapsedS] = useState<number | null>(null);
+  const handleReplayElapsedChange = useCallback((elapsedS: number, phase: string) => {
+    setReplayElapsedS(phase === "playing" ? elapsedS : null);
+  }, []);
+
+  const effectiveCurrentTime = replayElapsedS ?? currentTime;
+  const effectiveScrubFrac = episode?.duration ? effectiveCurrentTime / episode.duration : 0;
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      {cameras.length === 0 ? (
+        <div className="flex flex-1 items-center justify-center rounded-md border border-border bg-muted/30 text-sm text-muted-foreground">
+          {t("dialogs.datasetDetail.noCameras")}
+        </div>
+      ) : (
+        <div
+          ref={gridWrapRef}
+          className="relative flex-1 overflow-auto rounded-md border border-border bg-[#0c0f14]"
+        >
+          <div
+            className="grid justify-center content-center gap-2 p-2"
+            style={{
+              gridTemplateColumns: `repeat(${layout.cols}, ${layout.tileW}px)`,
+              gridAutoRows: `${layout.tileH}px`,
+            }}
+          >
+            {cameras.map((camera) => (
+              <div
+                key={camera}
+                className="relative overflow-hidden rounded border border-white/10 bg-black"
+              >
+                <span className="absolute left-1.5 top-1.5 z-10 rounded bg-black/50 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-zinc-100">
+                  {camera}
+                </span>
+                {videoErrors[camera] ? (
+                  <div className="flex h-full w-full flex-col items-center justify-center gap-1 px-3 text-center text-zinc-300">
+                    <VideoOff className="h-4 w-4" />
+                    <p className="text-[10px] leading-snug">
+                      {t("dialogs.datasetDetail.videoDecodeError")}
+                    </p>
+                  </div>
+                ) : (
+                  <video
+                    key={`${repoId}:${selectedEpisode}:${camera}`}
+                    ref={(el) => {
+                      videoRefs.current[camera] = el;
+                    }}
+                    src={episodeVideoUrl(baseUrl, repoId, selectedEpisode, camera)}
+                    className="h-full w-full object-cover"
+                    muted
+                    playsInline
+                    onLoadedMetadata={(e) => {
+                      // Only claim the position if the viewer is still parked.
+                      // These are Range-backed (sometimes Hub-fetched) videos
+                      // and play is enabled as soon as `episode` resolves, so
+                      // a user can press play or scrub BEFORE metadata lands.
+                      // A currentTime write before metadata only sets the
+                      // default start position, which this would overwrite —
+                      // starting playback 0.5s in and skipping the opening,
+                      // the exact bug previewT exists to avoid. With several
+                      // cameras only the slow ones would jump, desyncing the
+                      // grid for the rest of the episode.
+                      e.currentTarget.currentTime =
+                        offsetFor(camera) + (parkedAtPreview ? previewT : currentTime);
+                    }}
+                    onTimeUpdate={
+                      camera === primaryCamera
+                        ? (e) => handlePrimaryTimeUpdate(e.currentTarget.currentTime)
+                        : undefined
+                    }
+                    onEnded={camera === primaryCamera ? handlePrimaryEnded : undefined}
+                    onError={() =>
+                      setVideoErrors((prev) => ({ ...prev, [camera]: true }))
+                    }
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {cameras.length > 0 ? (
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-8 w-8 shrink-0"
+            onClick={() => gotoEpisode(-1)}
+            disabled={!episode || !hasPrev}
+            aria-label={t("dialogs.datasetDetail.previousEpisode")}
+          >
+            <SkipBack className="h-3.5 w-3.5" />
+          </Button>
+          <Button
+            size="icon"
+            className="h-8 w-8 shrink-0"
+            onClick={handlePlayPause}
+            disabled={!episode}
+            aria-label={
+              playing
+                ? t("dialogs.datasetDetail.pause")
+                : t("dialogs.datasetDetail.play")
+            }
+          >
+            {playing ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+          </Button>
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-8 w-8 shrink-0"
+            onClick={() => gotoEpisode(1)}
+            disabled={!episode || !hasNext}
+            aria-label={t("dialogs.datasetDetail.nextEpisode")}
+          >
+            <SkipForward className="h-3.5 w-3.5" />
+          </Button>
+          <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+            {episode ? `${fmtTime(currentTime)} / ${fmtTime(episode.duration)}` : "—"}
+          </span>
+          <div
+            ref={scrubRef}
+            className="relative h-5 flex-1 cursor-pointer"
+            onPointerDown={(e) => {
+              draggingRef.current = true;
+              e.currentTarget.setPointerCapture(e.pointerId);
+              forEachVideo((v) => v.pause());
+              setPlaying(false);
+              seekFromClientX(e.clientX);
+            }}
+            onPointerMove={(e) => {
+              if (draggingRef.current) seekFromClientX(e.clientX);
+            }}
+            onPointerUp={(e) => {
+              draggingRef.current = false;
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            }}
+          >
+            <div className="absolute inset-y-0 my-auto h-1 w-full rounded-full bg-muted" />
+            <div
+              className="absolute inset-y-0 my-auto h-1 rounded-full bg-foreground"
+              style={{ width: `${scrubFrac * 100}%` }}
+            />
+            <div
+              className="absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full bg-foreground shadow"
+              style={{ left: `calc(${scrubFrac * 100}% - 6px)` }}
+            />
+          </div>
+        </div>
+      ) : null}
+
+      <JointPositionChart joints={joints} episode={episode} scrubFrac={effectiveScrubFrac} />
+      <EpisodeReplayPanel
+        repoId={repoId}
+        episodeIndex={selectedEpisode}
+        onElapsedChange={handleReplayElapsedChange}
+      />
+    </div>
+  );
+};
+
+const DatasetDetailDialog: React.FC<DatasetDetailDialogProps> = ({
+  repoId,
+  open,
+  onOpenChange,
+  onStudioAction,
+  onDeleted,
+  item,
+  finalize,
+}) => {
+  const { t } = useTranslation();
+  const { language } = useLanguage();
+  // `.eyebrow` bundles `uppercase` with letter-spacing; the uppercase is a
+  // no-op on Chinese but the tracking is not, so both come off together.
+  const eyebrow = isCaselessScript(language)
+    ? "text-[11px] font-semibold text-muted-foreground"
+    : "eyebrow";
+  const { baseUrl, fetchWithHeaders } = useApi();
+  const { openStudio } = useStudio();
+  const { setSelectedDataset } = useSelectedDataset();
+  const { toast } = useToast();
+
+  const [episodes, setEpisodes] = useState<EpisodeSummary[] | null>(null);
+  const [episodesLoading, setEpisodesLoading] = useState(true);
+  // Why the episode list is missing, when it is. The list used to be swallowed
+  // into a plain `null`, which reads exactly like "this dataset has no
+  // episodes" — and in Finalize mode left a dead button and no way out. The
+  // backend's own message is server prose (never translated); the title
+  // beside it is ours.
+  const [episodesError, setEpisodesError] = useState<string | null>(null);
+
+  // Per-weight training-mix tiers, newest-lever-first. Share is measured in
+  // FRAMES (length x weight), not episodes: episodes differ in length, so an
+  // episode count would misstate how much of training each tier actually is.
+  // Returns a single tier for an unweighted dataset, which the panel uses as
+  // its "nothing to show" signal.
+  const weightTiers = useMemo(() => {
+    if (!episodes || episodes.length === 0) return [];
+    const byWeight = new Map<number, { episodes: number; frames: number }>();
+    for (const ep of episodes) {
+      const weight = ep.sampling_weight ?? 1;
+      const tier = byWeight.get(weight) ?? { episodes: 0, frames: 0 };
+      tier.episodes += 1;
+      tier.frames += ep.length * weight;
+      byWeight.set(weight, tier);
+    }
+    const total = [...byWeight.values()].reduce((sum, t) => sum + t.frames, 0);
+    return [...byWeight.entries()]
+      .sort((a, b) => b[0] - a[0])
+      .map(([weight, t]) => ({
+        weight,
+        episodes: t.episodes,
+        share: total > 0 ? Math.round((t.frames / total) * 100) : 0,
+      }));
+  }, [episodes]);
+  const [cameras, setCameras] = useState<string[]>([]);
+  const [selectedEpisode, setSelectedEpisode] = useState<number | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  // Episodes excluded from training (curation, not deletion — see
+  // replayApi's getExcludedEpisodes). The last SAVED state; while
+  // `selecting` is true, edits live in `draftExcluded` instead and only land
+  // here once "Done" commits them.
+  const [excludedEpisodes, setExcludedEpisodesState] = useState<Set<number>>(
+    new Set(),
+  );
+  // Selection mode: checkboxes only render, and Train + the dataset-info
+  // panel only unblock, outside of this. Entering it seeds the draft from
+  // the last saved state; leaving without pressing Done (closing the dialog,
+  // switching datasets) abandons it — see the reset in the load effect below.
+  const [selecting, setSelecting] = useState(false);
+  const [draftExcluded, setDraftExcluded] = useState<Set<number>>(new Set());
+  const [savingSelection, setSavingSelection] = useState(false);
+
+  // Finalize review (see the `finalize` prop doc): which episodes to KEEP,
+  // separate from `excludedEpisodes`/`draftExcluded` above — those persist a
+  // training-time exclusion list and never delete anything, while this drives
+  // an actual permanent delete when Finalize is clicked. The two modes are
+  // mutually exclusive (the curation toggle is hidden while `finalize` is
+  // set), so they never observe or edit each other's state.
+  const [finalizeKeep, setFinalizeKeep] = useState<Set<number>>(new Set());
+  const [finalizing, setFinalizing] = useState(false);
+
+  // Per-episode delete (permanent, no trash) — the pending index awaiting
+  // confirmation, and whether the confirmed delete request is in flight.
+  const [episodeDeleteTarget, setEpisodeDeleteTarget] = useState<number | null>(null);
+  const [deletingEpisode, setDeletingEpisode] = useState(false);
+
+  // Whole-dataset delete via the info card (permanent, local-only — see
+  // deleteDataset). Only offered when the caller passed `item`.
+  const [datasetDeleteConfirm, setDatasetDeleteConfirm] = useState(false);
+  const [deletingDataset, setDeletingDataset] = useState(false);
+
+  // Whether a delete happened while this dataset was open for browsing (set
+  // by confirmDeleteEpisode's PARTIAL-delete branch — the whole-dataset paths
+  // already call onDeleted immediately themselves, since they close the
+  // dialog on the spot). A partial delete only refetches the episode list
+  // INSIDE this dialog (reloadKey) — the caller's own list (episode count,
+  // or the dataset's continued existence) is stale until the viewer actually
+  // closes, so onDeleted fires then instead of on every single delete.
+  const hadDeletionRef = useRef(false);
+  useEffect(() => {
+    hadDeletionRef.current = false;
+  }, [repoId]);
+  const handleOpenChange = (next: boolean) => {
+    if (!next && hadDeletionRef.current) {
+      hadDeletionRef.current = false;
+      onDeleted?.();
+    }
+    onOpenChange(next);
+  };
+
+  useEffect(() => {
+    if (!repoId || !open) return;
+    const controller = new AbortController();
+    setEpisodesLoading(true);
+    setEpisodes(null);
+    setEpisodesError(null);
+    setCameras([]);
+    setExcludedEpisodesState(new Set());
+    setSelecting(false);
+    Promise.all([
+      listEpisodes(baseUrl, fetchWithHeaders, repoId, controller.signal)
+        .then((eps) => ({ eps, error: null as string | null }))
+        .catch((e) => ({
+          eps: null,
+          // A failed listing is reported, not silently rendered as an empty
+          // dataset — Finalize can't act on a list it never got.
+          error: backendDetail(e) ?? (e instanceof Error ? e.message : String(e)),
+        })),
+      getDatasetInfo(baseUrl, fetchWithHeaders, repoId, controller.signal).catch(() => null),
+      getExcludedEpisodes(baseUrl, fetchWithHeaders, repoId, controller.signal).catch(() => []),
+    ]).then(([episodesResult, info, excluded]) => {
+      if (controller.signal.aborted) return;
+      const eps = episodesResult.eps;
+      setEpisodes(eps);
+      setEpisodesError(episodesResult.error);
+      setCameras(info?.cameras ?? []);
+      setExcludedEpisodesState(new Set(excluded));
+      // Finalize starts every episode checked (kept) — only unchecking marks
+      // one for deletion.
+      setFinalizeKeep(new Set((eps ?? []).map((e) => e.episode_index)));
+      setSelectedEpisode(eps && eps.length > 0 ? eps[0].episode_index : null);
+      setEpisodesLoading(false);
+    });
+    return () => controller.abort();
+  }, [repoId, open, baseUrl, fetchWithHeaders, reloadKey]);
+
+  const validEpisodeIndices = new Set((episodes ?? []).map((e) => e.episode_index));
+  const activeExcluded = selecting ? draftExcluded : excludedEpisodes;
+  const includedEpisodes = (episodes ?? [])
+    .map((e) => e.episode_index)
+    .filter((i) => !activeExcluded.has(i));
+
+  const startSelecting = () => {
+    setDraftExcluded(new Set(excludedEpisodes));
+    setSelecting(true);
+  };
+
+  const toggleDraftEpisode = (episodeIndex: number) => {
+    setDraftExcluded((prev) => {
+      const next = new Set(prev);
+      if (next.has(episodeIndex)) {
+        next.delete(episodeIndex);
+      } else {
+        next.add(episodeIndex);
+      }
+      return next;
+    });
+  };
+
+  const finishSelecting = () => {
+    if (!repoId) return;
+    const persisted = [...draftExcluded].filter((i) => validEpisodeIndices.has(i));
+    setSavingSelection(true);
+    setExcludedEpisodes(baseUrl, fetchWithHeaders, repoId, persisted)
+      .then(() => {
+        setExcludedEpisodesState(new Set(persisted));
+        setSelecting(false);
+      })
+      .catch(() => {
+        toast({
+          title: t("dialogs.datasetDetail.curateSaveFailedTitle"),
+          description: t("dialogs.datasetDetail.curateSaveFailedBody"),
+          variant: "destructive",
+        });
+      })
+      .finally(() => setSavingSelection(false));
+  };
+
+  const toggleFinalizeKeep = (episodeIndex: number) => {
+    setFinalizeKeep((prev) => {
+      const next = new Set(prev);
+      if (next.has(episodeIndex)) {
+        next.delete(episodeIndex);
+      } else {
+        next.add(episodeIndex);
+      }
+      return next;
+    });
+  };
+
+  // Finalize: permanently delete every UNCHECKED episode (nothing to delete —
+  // and no request at all — if everything stayed checked), then hand off to
+  // the caller. Deleting every remaining episode removes the whole dataset
+  // instead (the backend refuses to produce a zero-episode dataset), so that
+  // outcome reports through `onDiscarded` rather than `onFinalize` — same
+  // signal the manual per-episode delete-to-zero path below already sends.
+  const handleFinalizeClick = async () => {
+    if (!repoId || !episodes || !finalize) return;
+    const toDelete = episodes
+      .map((e) => e.episode_index)
+      .filter((i) => !finalizeKeep.has(i));
+    if (toDelete.length === 0) {
+      finalize.onFinalize();
+      return;
+    }
+    setFinalizing(true);
+    try {
+      const result = await deleteEpisodes(baseUrl, fetchWithHeaders, repoId, toDelete);
+      if (result.whole_dataset_deleted) {
+        onOpenChange(false);
+        onDeleted?.();
+        finalize.onDiscarded();
+      } else {
+        // A partial delete changes the episode count the caller's own card is
+        // showing, exactly like the manual per-episode path — tell it, or the
+        // library keeps the pre-Finalize count until something else refreshes.
+        onDeleted?.();
+        finalize.onFinalize();
+      }
+    } catch (e) {
+      toast({
+        title: t("dialogs.datasetDetail.finalizeFailedTitle"),
+        description:
+          backendDetail(e) ?? t("dialogs.datasetDetail.finalizeFailedBody"),
+        variant: "destructive",
+      });
+    } finally {
+      setFinalizing(false);
+    }
+  };
+
+  // The escape hatch out of Finalize: keep every episode and leave, deleting
+  // nothing. Runs the SAME continuation a Finalize with nothing unchecked runs
+  // (fold the form, open the library, start the Hub push), because a reload —
+  // the only other way out of a non-dismissable dialog — would drop that push.
+  const handleKeepAllAndClose = () => {
+    finalize?.onFinalize();
+  };
+
+  // Per-episode delete (permanent, no trash/undo). Re-fetches the episode
+  // list afterward rather than relabeling client-side: lerobot's delete
+  // renumbers surviving episodes to stay contiguous from 0, so anything but
+  // the last episode in the list would otherwise show the wrong episode's
+  // data under a stale label.
+  const confirmDeleteEpisode = async () => {
+    const target = episodeDeleteTarget;
+    if (!repoId || target == null) return;
+    setDeletingEpisode(true);
+    try {
+      const result = await deleteEpisodes(baseUrl, fetchWithHeaders, repoId, [target]);
+      setEpisodeDeleteTarget(null);
+      if (result.whole_dataset_deleted) {
+        onOpenChange(false);
+        onDeleted?.();
+      } else {
+        hadDeletionRef.current = true;
+        setReloadKey((k) => k + 1);
+      }
+    } catch (e) {
+      // The backend's refusal says WHY (dataset busy, index out of range) —
+      // far more use than a generic "try again".
+      toast({
+        title: t("dialogs.datasetDetail.deleteEpisodeFailedTitle"),
+        description:
+          backendDetail(e) ?? t("dialogs.datasetDetail.deleteEpisodeFailedBody"),
+        variant: "destructive",
+      });
+    } finally {
+      setDeletingEpisode(false);
+    }
+  };
+
+  // Whole-dataset delete via the info card. `resolveDeleteAction` decides BOTH
+  // the confirm dialog's wording and which route runs: a local-only row and a
+  // "both" row's first press remove the local directory (deleteDataset, which
+  // never touches a Hub copy), while a Hub-only row has no local directory at
+  // all and is only removed from the listing — unpinned or hidden, the same
+  // two calls PolicyManageDialog makes for a model.
+  const datasetDeleteResolution = item ? resolveDeleteAction("dataset", item) : null;
+  const confirmDeleteDataset = async () => {
+    if (!repoId || !datasetDeleteResolution) return;
+    setDeletingDataset(true);
+    try {
+      if (datasetDeleteResolution.action === "unpin") {
+        await removeCustomDataset(baseUrl, fetchWithHeaders, repoId);
+      } else if (datasetDeleteResolution.action === "hide") {
+        await hideDataset(baseUrl, fetchWithHeaders, repoId);
+      } else {
+        // A refusal here answers 200 with {success: false, message} rather
+        // than an error status, so the flag has to be read — otherwise the
+        // dialog closes and the caller drops a dataset that still exists.
+        const result = await deleteDataset(baseUrl, fetchWithHeaders, repoId);
+        if (!result.success) {
+          toast({
+            title: t("dialogs.datasetDetail.deleteDatasetFailedTitle"),
+            description:
+              result.message || t("dialogs.datasetDetail.deleteDatasetFailedBody"),
+            variant: "destructive",
+          });
+          return;
+        }
+      }
+      setDatasetDeleteConfirm(false);
+      onOpenChange(false);
+      onDeleted?.();
+    } catch (e) {
+      toast({
+        title: t("dialogs.datasetDetail.deleteDatasetFailedTitle"),
+        description:
+          backendDetail(e) ?? t("dialogs.datasetDetail.deleteDatasetFailedBody"),
+        variant: "destructive",
+      });
+    } finally {
+      setDeletingDataset(false);
+    }
+  };
+
+  if (!repoId) return null;
+
+  const handleTrain = () => {
+    setSelectedDataset(repoId);
+    const allIncluded = includedEpisodes.length === (episodes?.length ?? 0);
+    openStudio("train", {
+      train: {
+        datasetRepoId: repoId,
+        episodeIndices: allIncluded ? undefined : includedEpisodes,
+      },
+    });
+    onOpenChange(false);
+    onStudioAction?.();
+  };
+
+  return (
+    <>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent
+        hideClose={!!finalize}
+        onEscapeKeyDown={finalize ? (e) => e.preventDefault() : undefined}
+        onPointerDownOutside={finalize ? (e) => e.preventDefault() : undefined}
+        onInteractOutside={finalize ? (e) => e.preventDefault() : undefined}
+        className="flex h-[85vh] max-w-6xl flex-col gap-0 overflow-hidden p-0"
+      >
+        <DialogHeader className="shrink-0 space-y-0 border-b border-border px-6 py-4 text-left">
+          <p className={eyebrow}>{t("dialogs.datasetDetail.eyebrow")}</p>
+          <DialogTitle className="break-all pt-1 font-mono text-base font-semibold">
+            {repoId}
+          </DialogTitle>
+          {finalize && (
+            <p className="pt-1 text-sm text-muted-foreground">
+              {t("dialogs.datasetDetail.finalizeDescription")}
+            </p>
+          )}
+        </DialogHeader>
+
+        <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_300px]">
+          <div className="flex min-h-0 min-w-0 flex-col gap-3 p-4">
+            {episodesLoading ? (
+              <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+                {t("dialogs.datasetDetail.loadingEpisodes")}
+              </div>
+            ) : episodes && episodes.length > 0 && selectedEpisode != null ? (
+              <EpisodeViewer
+                repoId={repoId}
+                cameras={cameras}
+                episodes={episodes}
+                selectedEpisode={selectedEpisode}
+                onSelectEpisode={setSelectedEpisode}
+              />
+            ) : (
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 rounded-md border border-dashed border-border bg-muted/30 px-6 text-center">
+                <VideoOff className="h-6 w-6 text-muted-foreground" />
+                <p className="text-sm font-medium text-foreground">
+                  {episodes && episodes.length === 0
+                    ? t("dialogs.datasetDetail.noEpisodesTitle")
+                    : t("dialogs.datasetDetail.noFootageTitle")}
+                </p>
+                <p className="max-w-sm text-xs text-muted-foreground">
+                  {episodes && episodes.length === 0
+                    ? t("dialogs.datasetDetail.noEpisodesBody")
+                    : t("dialogs.datasetDetail.noFootageBody")}
+                </p>
+              </div>
+            )}
+          </div>
+
+          <div className="flex min-h-0 flex-col divide-y divide-border overflow-y-auto border-l border-border">
+            <div className="flex min-h-0 flex-1 flex-col p-3">
+              <div className="mb-2">
+                <div className="flex items-center justify-between gap-2">
+                  <p className={eyebrow}>
+                    {episodes
+                      ? t("dialogs.datasetDetail.episodesHeadingWithCount", {
+                          total: episodes.length,
+                        })
+                      : t("dialogs.datasetDetail.episodesHeading")}
+                  </p>
+                  {/* Hidden during Finalize: it edits a training-time
+                      exclusion list that's a different, longer-lived concern
+                      than the keep/delete checkboxes Finalize shows below,
+                      and reviewing a not-yet-finalized dataset for training
+                      makes no sense yet. */}
+                  {!finalize && episodes && episodes.length > 0 && (
+                    <Button
+                      size="sm"
+                      variant={selecting ? "default" : "outline"}
+                      onClick={selecting ? finishSelecting : startSelecting}
+                      disabled={savingSelection}
+                      className="h-6 gap-1 px-2 text-[11px]"
+                    >
+                      {savingSelection ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : selecting ? (
+                        <Check className="h-3 w-3" />
+                      ) : null}
+                      {selecting
+                        ? t("dialogs.datasetDetail.curateDone")
+                        : t("dialogs.datasetDetail.curateEpisodes")}
+                    </Button>
+                  )}
+                </div>
+                {!finalize && activeExcluded.size > 0 && (
+                  <p className="mt-0.5 text-[10px] text-muted-foreground">
+                    {t("dialogs.datasetDetail.includedCount", {
+                      included: includedEpisodes.length,
+                      total: episodes?.length ?? 0,
+                    })}
+                  </p>
+                )}
+              </div>
+              {/* Training mix. Rendered only for a weighted dataset, and only
+                  here — the share is computed from the episode list this panel
+                  already holds, so it needs no extra request and no prop
+                  threading through DatasetInfoCard (which only receives totals).
+
+                  The SHARE is the number worth showing: "×3" is the lever, but
+                  "60% of sampled frames" is the thing being tuned. Frames, not
+                  episodes, because episodes differ in length. */}
+              {weightTiers.length > 1 ? (
+                <div className="mb-2 rounded-md border border-border bg-muted/40 p-2">
+                  <div className="mb-1 text-[11px] font-medium text-foreground">
+                    {t("dialogs.datasetDetail.mixTitle")}
+                  </div>
+                  <div className="space-y-0.5">
+                    {weightTiers.map((tier) => (
+                      <div
+                        key={tier.weight}
+                        className="flex items-baseline justify-between gap-2 font-mono text-[10.5px] tabular-nums"
+                      >
+                        <span className={tier.weight !== 1 ? "text-info" : "text-muted-foreground"}>
+                          {t("dialogs.datasetDetail.mixTier", {
+                            weight: String(tier.weight),
+                            count: tier.episodes,
+                          })}
+                        </span>
+                        <span className="text-muted-foreground">
+                          {t("dialogs.datasetDetail.mixShare", {
+                            percent: tier.share,
+                          })}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                {episodesError ? (
+                  /* The list failed to load. Say so (with the backend's own
+                     message, which renders in English like every server
+                     string) and offer the fetch again — silently showing an
+                     empty list here is how Finalize ended up with a button
+                     that did nothing. */
+                  <div className="space-y-2 px-1">
+                    <p className="text-xs font-medium text-destructive">
+                      {t("dialogs.datasetDetail.episodesLoadFailedTitle")}
+                    </p>
+                    <p className="text-xs leading-relaxed text-muted-foreground">
+                      {episodesError}
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setReloadKey((k) => k + 1)}
+                      className="h-6 px-2 text-[11px]"
+                    >
+                      {t("dialogs.datasetDetail.episodesRetry")}
+                    </Button>
+                  </div>
+                ) : episodes && episodes.length > 0 ? (
+                  <div className="space-y-0.5">
+                    {episodes.map((ep) => (
+                      <div
+                        key={ep.episode_index}
+                        className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs transition-colors hover:bg-accent ${
+                          selectedEpisode === ep.episode_index
+                            ? "border border-border bg-accent"
+                            : "border border-transparent"
+                        }`}
+                      >
+                        {finalize ? (
+                          <Checkbox
+                            checked={finalizeKeep.has(ep.episode_index)}
+                            onCheckedChange={() => toggleFinalizeKeep(ep.episode_index)}
+                            aria-label={t("dialogs.datasetDetail.keepEpisodeAria", {
+                              index: ep.episode_index,
+                            })}
+                            className="h-3.5 w-3.5 shrink-0 border-muted-foreground/40 data-[state=checked]:border-primary"
+                          />
+                        ) : selecting ? (
+                          <Checkbox
+                            checked={!draftExcluded.has(ep.episode_index)}
+                            onCheckedChange={() => toggleDraftEpisode(ep.episode_index)}
+                            aria-label={t("dialogs.datasetDetail.includeEpisodeAria", {
+                              index: ep.episode_index,
+                            })}
+                            className="h-3.5 w-3.5 shrink-0 border-muted-foreground/40 data-[state=checked]:border-primary"
+                          />
+                        ) : null}
+                        <button
+                          type="button"
+                          onClick={() => setSelectedEpisode(ep.episode_index)}
+                          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                        >
+                          <span className="w-6 shrink-0 font-mono text-[11px] text-muted-foreground">
+                            {String(ep.episode_index).padStart(2, "0")}
+                          </span>
+                          <span className="min-w-0 flex-1 truncate">
+                            {t("dialogs.datasetDetail.episodeRow", {
+                              index: ep.episode_index,
+                            })}
+                          </span>
+                          {/* Oversampled episodes only. A weight of 1 is the
+                              default for every episode ever recorded, so showing
+                              "×1" on every row would be noise on the common case.
+                              `?? 1` because an older backend omits the field. */}
+                          {(ep.sampling_weight ?? 1) !== 1 ? (
+                            <span
+                              className="shrink-0 font-mono text-[10.5px] tabular-nums text-info"
+                              title={t("dialogs.datasetDetail.weightTitle", {
+                                weight: String(ep.sampling_weight ?? 1),
+                              })}
+                            >
+                              {t("dialogs.datasetDetail.weightTimes", {
+                                weight: String(ep.sampling_weight ?? 1),
+                              })}
+                            </span>
+                          ) : null}
+                          <span className="shrink-0 font-mono text-[10.5px] tabular-nums text-muted-foreground">
+                            {ep.duration.toFixed(1)}s
+                          </span>
+                        </button>
+                        {/* Per-episode delete (permanent, no trash) — a
+                            separate action from Finalize's keep/delete
+                            checkboxes and from training curation, so it's
+                            offered only outside both of those modes. */}
+                        {!finalize && !selecting && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
+                            onClick={() => setEpisodeDeleteTarget(ep.episode_index)}
+                            aria-label={t("dialogs.datasetDetail.deleteEpisodeAria", {
+                              index: ep.episode_index,
+                            })}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="px-1 text-xs leading-relaxed text-muted-foreground">
+                    {t("dialogs.datasetDetail.episodesEmpty")}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {/* Non-related while picking episodes to train on, or while
+                reviewing a Finalize checklist — rename, tags, visibility,
+                upload/download, delete-whole-dataset all live here, none of
+                it relevant to either. A dimmed pointer-events-none wrapper
+                keeps this from needing a `disabled` prop threaded through
+                DatasetInfoCard's internals. Finalize also hides its own
+                delete affordance — that would be redundant with (or conflict
+                with) the keep/delete checkboxes on the left. */}
+            <div
+              className={selecting || finalize ? "pointer-events-none p-3 opacity-40" : "p-3"}
+              aria-disabled={selecting || !!finalize}
+            >
+              <DatasetInfoCard
+                repoId={repoId}
+                onDownloaded={() => setReloadKey((k) => k + 1)}
+                canDelete={!finalize && !!item}
+                onDelete={() => setDatasetDeleteConfirm(true)}
+              />
+            </div>
+
+            <div className="p-3">
+              {finalize ? (
+                <div className="space-y-2">
+                  <Button
+                    onClick={handleFinalizeClick}
+                    disabled={finalizing || episodesLoading || !episodes}
+                    title={
+                      episodesError
+                        ? t("dialogs.datasetDetail.finalizeUnavailable")
+                        : undefined
+                    }
+                    className="w-full gap-2"
+                  >
+                    {finalizing ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Check className="h-4 w-4" />
+                    )}
+                    {t("dialogs.datasetDetail.finalize")}
+                  </Button>
+                  {episodesError && (
+                    <p className="text-[11px] leading-relaxed text-muted-foreground">
+                      {t("dialogs.datasetDetail.finalizeUnavailable")}
+                    </p>
+                  )}
+                  {/* Always available, including when the list never loaded:
+                      this dialog can't be dismissed any other way, and a
+                      reload would drop the pending Hub push. */}
+                  <Button
+                    variant="outline"
+                    onClick={handleKeepAllAndClose}
+                    disabled={finalizing}
+                    className="w-full"
+                  >
+                    {t("dialogs.datasetDetail.keepAllAndClose")}
+                  </Button>
+                </div>
+              ) : (
+                <Button
+                  onClick={handleTrain}
+                  disabled={selecting || includedEpisodes.length === 0}
+                  title={
+                    selecting
+                      ? t("dialogs.datasetDetail.finishCuratingFirst")
+                      : undefined
+                  }
+                  className="w-full gap-2"
+                >
+                  <Boxes className="h-4 w-4" />
+                  {t("dialogs.datasetDetail.trainPolicy")}
+                </Button>
+              )}
+            </div>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+
+      <AlertDialog
+        open={episodeDeleteTarget !== null}
+        onOpenChange={(o) => !o && setEpisodeDeleteTarget(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t("dialogs.datasetDetail.deleteEpisodeTitle", {
+                index: episodeDeleteTarget ?? 0,
+              })}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {item?.source === "both"
+                ? t("dialogs.datasetDetail.deleteEpisodeDescriptionOnHub")
+                : t("dialogs.datasetDetail.deleteEpisodeDescription")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingEpisode}>
+              {t("common.cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={confirmDeleteEpisode}
+              disabled={deletingEpisode}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {t("dialogs.datasetDetail.deleteEpisodeConfirm")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={datasetDeleteConfirm}
+        onOpenChange={(o) => !o && setDatasetDeleteConfirm(false)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="break-words">
+              {datasetDeleteResolution
+                ? t(datasetDeleteResolution.titleKey as never, { label: repoId })
+                : null}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {datasetDeleteResolution
+                ? t(datasetDeleteResolution.descriptionKey as never)
+                : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingDataset}>
+              {t("common.cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                // Radix closes on click; a refused delete has to keep the
+                // confirm open so its error is attached to something.
+                e.preventDefault();
+                void confirmDeleteDataset();
+              }}
+              disabled={deletingDataset}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {datasetDeleteResolution
+                ? t(datasetDeleteResolution.confirmKey as never)
+                : null}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+};
+
+export default DatasetDetailDialog;
