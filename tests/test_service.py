@@ -230,7 +230,7 @@ class TestTeleop:
         status = rig.status()
         assert status["source"] == "none"
         assert status["teleop"]["active"] is False
-        assert rig.arm("left_follower")["mode"] == "HOLD"
+        rig.wait(lambda: rig.arm("left_follower")["mode"] == "HOLD", what="hold mode")
 
     def test_presets_cover_cross_model_pairs(self, bound_rig):
         config = bound_rig.client.teleop_config()

@@ -1367,20 +1367,21 @@ class Runtime:
 
     def _policy_loop(self) -> None:
         """Feed buffered actions to the controller at the configured action rate."""
-        next_tick = time.monotonic()
+        # perf_counter, because monotonic ticks at 15.6 ms on Windows with Python 3.12.
+        next_tick = time.perf_counter()
         while not self._stop.is_set():
             config = self.policy_config
             if self.policy_state != "running" or not config or not self.policy_buffer:
                 time.sleep(0.01)
-                next_tick = time.monotonic()
+                next_tick = time.perf_counter()
                 continue
             dt = 1.0 / config.get("action_hz", 30.0)
             next_tick += dt
-            delay = next_tick - time.monotonic()
+            delay = next_tick - time.perf_counter()
             if delay > 0:
                 time.sleep(delay)
             else:
-                next_tick = time.monotonic()
+                next_tick = time.perf_counter()
             device = self.device
             if not device or not device.is_open:
                 continue

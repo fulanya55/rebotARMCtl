@@ -2630,6 +2630,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "pyarrow" },
+    { name = "rac-camera" },
     { name = "rac-link" },
 ]
 
@@ -2639,6 +2640,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "pandas", specifier = ">=2" },
     { name = "pyarrow", specifier = ">=15" },
+    { name = "rac-camera", editable = "packages/rac-camera" },
     { name = "rac-link", editable = "packages/rac-link" },
 ]
 
@@ -2690,6 +2692,7 @@ source = { editable = "packages/rac-policy" }
 dependencies = [
     { name = "msgpack" },
     { name = "numpy" },
+    { name = "rac-camera" },
     { name = "rac-link" },
     { name = "websockets" },
 ]
@@ -2698,6 +2701,7 @@ dependencies = [
 requires-dist = [
     { name = "msgpack", specifier = ">=1.0" },
     { name = "numpy", specifier = ">=1.26" },
+    { name = "rac-camera", editable = "packages/rac-camera" },
     { name = "rac-link", editable = "packages/rac-link" },
     { name = "websockets", specifier = ">=12" },
 ]
