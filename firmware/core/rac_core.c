@@ -990,7 +990,7 @@ static void queue_update_goal(arm_t *a, uint64_t now, float *goal)
         }
         if (q->has_prev && !q->underrun_reported) {
             q->underrun_reported = 1;
-            send_event(RAC_EVT_QUEUE_UNDERRUN, (uint8_t)(a - g.arms), 1, q->exec_seq, 0);
+            send_event(RAC_EVT_QUEUE_UNDERRUN, (uint8_t)(a - g.arms), 0, q->exec_seq, 0);
         }
     }
 }

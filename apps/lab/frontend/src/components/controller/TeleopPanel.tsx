@@ -45,6 +45,14 @@ const TeleopPanel: React.FC = () => {
   const bindings = status?.ports.map((p) => p.binding?.arm).join(",");
   useEffect(load, [load, bindings]);
 
+  // What is shown has to be what is in effect, so anything changed elsewhere appears
+  // here, unless the user is in the middle of editing.
+  useEffect(() => {
+    if (dirty) return;
+    const timer = setInterval(load, 2000);
+    return () => clearInterval(timer);
+  }, [dirty, load]);
+
   if (!status?.connected) return <EmptyState>{t("controller.common.connectFirst")}</EmptyState>;
 
   const active = status.teleop.active;

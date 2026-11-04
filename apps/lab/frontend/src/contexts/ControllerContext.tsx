@@ -135,6 +135,8 @@ export interface ControllerEvent {
   host_ts_us: number;
   severity?: number;
   arm?: string | null;
+  /** Set on arrival, so the page can show an event only while it is recent. */
+  received_at?: number;
   [key: string]: unknown;
 }
 
@@ -215,7 +217,9 @@ export const ControllerProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         if (data.samples) samplesRef.current = data.samples;
         if (data.status) setStatus(data.status);
         if (data.events?.length) {
-          setEvents((previous) => [...previous, ...data.events].slice(-200));
+          const received_at = Date.now();
+          const fresh = data.events.map((event: ControllerEvent) => ({ ...event, received_at }));
+          setEvents((previous) => [...previous, ...fresh].slice(-200));
         }
       };
       socket.onclose = () => {

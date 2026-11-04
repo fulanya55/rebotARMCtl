@@ -228,6 +228,7 @@ class TestRecordingToLeRobot:
         assert [e["result"] for e in episodes] == ["success", "failure"]
         assert list_episodes(root, result="failure")[0]["episode_index"] == 1
         assert list_episodes(root, source="teleop")
+        assert "none" not in episodes[0]["sources"]
         assert episodes[0]["quality"]["followers"][0]["rate_hz"] > 100
         assert episodes[0]["quality"]["followers"][0]["missing"] == 0
 

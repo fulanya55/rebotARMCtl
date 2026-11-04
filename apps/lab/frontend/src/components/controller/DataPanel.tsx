@@ -71,6 +71,8 @@ interface EpisodeData {
   videos: Record<string, { path: string; from_s: number; to_s: number }>;
 }
 
+const SOURCE_BY_ID = ["none", "teleop", "teach", "policy", "intervention", "replay", "home", "guide"];
+
 const SERIES = "#4aa8ff";
 const ACTION = "#ff9d4a";
 
@@ -471,7 +473,7 @@ const DataPanel: React.FC = () => {
                         <button className="hover:underline" onClick={() => seek(interval.start_s)}>
                           {interval.start_s.toFixed(2)}-{interval.end_s.toFixed(2)} s
                         </button>{" "}
-                        {t(`controller.data.sourceLabel_${interval.intervention ? "intervention" : interval.source === 3 ? "policy" : "other"}` as never, { source: interval.source })}
+                        {t(`controller.source.${interval.intervention ? "intervention" : (SOURCE_BY_ID[interval.source] ?? "none")}` as never)}
                       </li>
                     ))}
                   </ul>

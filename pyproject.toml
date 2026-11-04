@@ -26,6 +26,7 @@ dev = [
     # through uv like every other tool, so no system compiler is required.
     "ziglang==0.15.2",
     "pyyaml>=6",
+    "playwright>=1.45",
 ]
 
 [tool.uv]

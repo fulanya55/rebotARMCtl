@@ -80,9 +80,10 @@ def list_episodes(root: str | Path, task: str | None = None, result: str | None 
         annotation = annotations.get(str(index), {})
         tasks = row.get("tasks") or []
         intervals = annotation.get("control_intervals", [])
-        sources = sorted({CONTROL_LABELS.get(i["source"], "none") for i in intervals})
+        labels = {CONTROL_LABELS.get(i["source"], "none") for i in intervals} - {"none"}
         if any(i.get("intervention") for i in intervals):
-            sources.append("intervention")
+            labels.add("intervention")
+        sources = sorted(labels)
         item = {
             "episode_index": index,
             "length": int(row["length"]),

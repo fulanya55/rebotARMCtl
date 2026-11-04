@@ -1,5 +1,5 @@
 /** The sync controller workspace: every controller function behind one run control bar. */
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { ArrowLeft } from "lucide-react";
@@ -15,6 +15,8 @@ import RunBar from "@/components/controller/RunBar";
 import TeachPanel from "@/components/controller/TeachPanel";
 import TeleopPanel from "@/components/controller/TeleopPanel";
 
+const EVENT_VISIBLE_MS = 15000;
+
 const TABS = ["device", "calibration", "teleop", "teach", "policy", "replay", "record", "data"] as const;
 
 const Workspace: React.FC = () => {
@@ -22,7 +24,23 @@ const Workspace: React.FC = () => {
   const { serviceError, events } = useController();
   const [params, setParams] = useSearchParams();
   const tab = TABS.includes(params.get("tab") as (typeof TABS)[number]) ? (params.get("tab") as string) : "device";
-  const recent = events.filter((e) => (e.severity ?? 0) >= 1).slice(-3).reverse();
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 2000);
+    return () => clearInterval(timer);
+  }, []);
+  // One line per kind, newest first, and only while it is recent.
+  const seen = new Set<string>();
+  const recent = events
+    .filter((e) => (e.severity ?? 0) >= 1 && now - (e.received_at ?? 0) < EVENT_VISIBLE_MS)
+    .reverse()
+    .filter((e) => {
+      const key = `${e.kind}:${e.arm ?? ""}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 3);
 
   return (
     <div className="min-h-screen bg-background text-foreground">
