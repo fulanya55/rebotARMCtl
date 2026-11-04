@@ -2661,12 +2661,14 @@ version = "0.1.0"
 source = { editable = "packages/rac-lerobot" }
 dependencies = [
     { name = "numpy" },
+    { name = "rac-camera" },
     { name = "rac-link" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
+    { name = "rac-camera", editable = "packages/rac-camera" },
     { name = "rac-link", editable = "packages/rac-link" },
 ]
 

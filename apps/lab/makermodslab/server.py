@@ -5728,6 +5728,14 @@ def ui_enabled() -> bool:
     return FRONTEND_DIST.exists() and os.environ.get("MAKERMODSLAB_NO_UI") != "1"
 
 
+# The sync controller: an extension in the sense of arms/registry.py. It adds its
+# arm family and routes here, so upstream's route lists and snapshots describe the
+# upstream surface. MAKERMODSLAB_NO_CONTROLLER=1 runs the Lab without it.
+if os.environ.get("MAKERMODSLAB_NO_CONTROLLER") != "1":
+    from .controller_routes import install_controller
+
+    install_controller(app)
+
 # Serve the built frontend at /. Must be mounted last so API routes win.
 if ui_enabled():
     app.mount("/", SPAStaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")

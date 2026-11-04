@@ -16,3 +16,7 @@ packages = ["src/rac_service"]
 [tool.uv.sources]
 rac-link = { workspace = true }
 rac-kinematics = { workspace = true }
+
+[project.scripts]
+rac = "rac_service.cli:main"
+rac-service = "rac_service.server:main"

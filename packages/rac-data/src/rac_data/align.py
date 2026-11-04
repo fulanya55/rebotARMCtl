@@ -88,7 +88,7 @@ def _smooth_host_time(mcu: np.ndarray, host: np.ndarray) -> np.ndarray:
         return host
     origin = mcu[0]
     slope, intercept = np.polyfit((mcu - origin).astype(np.float64), host.astype(np.float64), 1)
-    fitted = (intercept + slope * (mcu - origin).astype(np.float64)).astype(np.int64)
+    fitted = np.rint(intercept + slope * (mcu - origin).astype(np.float64)).astype(np.int64)
     return np.maximum.accumulate(fitted)
 
 

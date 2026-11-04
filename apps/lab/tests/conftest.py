@@ -15,6 +15,13 @@
 
 from __future__ import annotations
 
+import os
+
+# Upstream's route ratchets and arm lists describe the upstream surface, so its tests
+# run without the sync controller extension. tests/test_lab_integration.py at the
+# repository root covers the Lab with it installed.
+os.environ.setdefault("MAKERMODSLAB_NO_CONTROLLER", "1")
+
 import atexit
 import os
 import shutil

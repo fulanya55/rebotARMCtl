@@ -15,6 +15,7 @@ import remoteInference from "./remoteInference";
 import training from "./training";
 import pages from "./pages";
 import shared from "./shared";
+import controller from "./controller";
 
 /** Simplified Chinese catalog. Key tree must match `locales/en` exactly —
  * enforced by `src/i18n/catalogs.test.ts`. */
@@ -36,4 +37,5 @@ export default {
   training,
   pages,
   shared,
+  controller,
 } as const;

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
 import { ChevronUp, Library } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import BrandMark from "@/components/BrandMark";
@@ -63,6 +64,13 @@ const Launchpad = () => {
             <Library className="h-3.5 w-3.5" />
             {t("launchpad.header.myLibrary")}
           </Button>
+          <Link
+            to="/controller"
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            data-testid="controller-entry"
+          >
+            {t("controller.page.entry")}
+          </Link>
           <RobotToolbar tourTarget />
         </div>
       </header>
