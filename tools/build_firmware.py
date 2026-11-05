@@ -3,17 +3,16 @@
 
     uv run python tools/build_firmware.py sil      host executable with simulated arms
     uv run python tools/build_firmware.py test     host unit tests, then run them
-    uv run python tools/build_firmware.py stm32    STM32G474 image (needs arm-none-eabi-gcc)
+    uv run python tools/build_firmware.py stm32    STM32G474 image
 
-Host builds use ``zig cc`` from the ``ziglang`` wheel, so they need nothing
-beyond ``uv sync``. The Arm toolchain is looked up on PATH and then in .tools/.
+Every target uses ``zig cc`` from the ``ziglang`` wheel, so nothing is needed beyond
+``uv sync``. The STM32 target also needs tools/fetch_firmware_deps.py to have run.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -95,22 +94,8 @@ def build_tests() -> Path:
     return out
 
 
-def find_arm_gcc() -> str:
-    found = shutil.which("arm-none-eabi-gcc")
-    if found:
-        return found
-    for candidate in (ROOT / ".tools").glob("**/bin/arm-none-eabi-gcc*"):
-        if candidate.suffix in ("", ".exe"):
-            return str(candidate)
-    raise SystemExit(
-        "arm-none-eabi-gcc not found. Run: uv run python tools/fetch_firmware_deps.py --toolchain"
-    )
-
-
-def build_stm32(profile: str = "release") -> Path:
-    gcc = find_arm_gcc()
-    objcopy = str(Path(gcc).with_name(Path(gcc).name.replace("gcc", "objcopy")))
-    size = str(Path(gcc).with_name(Path(gcc).name.replace("gcc", "size")))
+def build_stm32() -> Path:
+    """Cross compile for the Cortex-M4F with the same Zig toolchain as the host builds."""
     port = FW / "port" / "stm32g4"
     tp = FW / "third_party"
     missing = [d for d in ("cmsis_core", "cmsis_device_g4", "tinyusb") if not (tp / d).exists()]
@@ -121,11 +106,8 @@ def build_stm32(profile: str = "release") -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     tusb = tp / "tinyusb" / "src"
-    sources = [
-        *core_sources(),
-        *sorted(port.glob("*.c")),
-        port / "startup_stm32g474.s",
-        tp / "cmsis_device_g4" / "Source" / "Templates" / "system_stm32g4xx.c",
+    ours = [*core_sources(), *sorted(port.glob("*.c"))]
+    theirs = [
         tusb / "tusb.c",
         tusb / "common" / "tusb_fifo.c",
         tusb / "device" / "usbd.c",
@@ -133,49 +115,51 @@ def build_stm32(profile: str = "release") -> Path:
         tusb / "class" / "cdc" / "cdc_device.c",
         tusb / "portable" / "st" / "stm32_fsdev" / "dcd_stm32_fsdev.c",
     ]
-    cpu = ["-mcpu=cortex-m4", "-mthumb", "-mfpu=fpv4-sp-d16", "-mfloat-abi=hard"]
-    cflags = [
-        *cpu,
-        "-std=c11",
+    target = ["-target", "thumb-freestanding-eabihf", "-mcpu=cortex_m4+vfp4d16sp"]
+    common = [
+        *target,
+        "-std=gnu11",  # TinyUSB's FSDEV driver uses the plain asm keyword
         "-O2",
-        "-g3",
+        "-g",
+        "-ffreestanding",
+        "-fno-math-errno",
         "-ffunction-sections",
         "-fdata-sections",
+        "-fno-sanitize=undefined",
         "-DSTM32G474xx",
-        "-DCFG_TUSB_MCU=OPT_MCU_STM32G4",
-        *WARN,
         f"-I{FW / 'core'}",
         f"-I{port}",
+        f"-I{port / 'libc'}",
         f"-I{tusb}",
         f"-I{tp / 'cmsis_core' / 'Include'}",
         f"-I{tp / 'cmsis_device_g4' / 'Include'}",
     ]
-    elf = out_dir / "rac_controller.elf"
     objects: list[Path] = []
-    for src in sources:
+    for src in ours:
         obj = out_dir / (src.stem + ".o")
-        # Third-party sources are compiled with their warnings left alone.
-        flags = [f for f in cflags if not (f.startswith("-W") and tp in src.parents)]
-        run([gcc, *flags, "-c", src, "-o", obj])
+        run([*zig_cc(), *common, *WARN, "-c", src, "-o", obj])
         objects.append(obj)
+    for src in theirs:
+        obj = out_dir / (src.stem + ".o")
+        run([*zig_cc(), *common, "-w", "-c", src, "-o", obj])
+        objects.append(obj)
+
+    elf = out_dir / "rac_controller.elf"
     run(
         [
-            gcc,
-            *cpu,
+            *zig_cc(),
+            *target,
+            "-nostdlib",
             f"-T{port / 'stm32g474.ld'}",
-            "--specs=nano.specs",
-            "--specs=nosys.specs",
             "-Wl,--gc-sections",
-            f"-Wl,-Map={out_dir / 'rac_controller.map'}",
+            "-Wl,--entry=Reset_Handler",
             *objects,
-            "-lm",
             "-o",
             elf,
         ]
     )
-    run([objcopy, "-O", "binary", elf, out_dir / "rac_controller.bin"])
-    run([objcopy, "-O", "ihex", elf, out_dir / "rac_controller.hex"])
-    run([size, elf])
+    for flag, name in (("binary", "rac_controller.bin"), ("hex", "rac_controller.hex")):
+        run([sys.executable, "-m", "ziglang", "objcopy", "-O", flag, elf, out_dir / name])
     return elf
 
 
