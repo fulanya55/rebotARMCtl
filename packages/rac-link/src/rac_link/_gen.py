@@ -156,6 +156,7 @@ class EventCode(IntEnum):
     QUEUE_CLEARED = 0x10
     OVERRUN = 0x11
     LEADER_STALE = 0x12
+    LEADER_JUMP = 0x13
 
 
 class EstopState(IntEnum):

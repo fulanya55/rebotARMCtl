@@ -1,9 +1,8 @@
 /*
  * RobStride RS00 / RS06 CAN driver (classic CAN, 1 Mbit/s).
  *
- * Written from the protocol, not from vendor sources: the reference repository
- * RobStride/RobStrideSPC declares no license, so only the frame layout and the
- * numeric ranges it documents are used. See docs/LICENSE_AUDIT.md.
+ * Frame layout and numeric ranges checked against the reference code in
+ * RobStride/RobStrideSPC, which targets an STM32F1 with blocking CAN calls.
  *
  * Two dialects are supported because both are in the field:
  *   - private protocol: 29-bit identifiers, the factory default, what the

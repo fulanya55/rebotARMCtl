@@ -4,15 +4,17 @@ Joint order is the dataset contract: six joints base to wrist, then the gripper.
 Joints are radians, the gripper is travel normalized to 0..1. A bimanual vector is
 the left arm followed by the right arm.
 
-Limits are the published URDF limits. Mapping presets between different models
-are a starting point derived from those limits and have not been checked against
-physical arms: confirm direction and offset joint by joint before following at
-speed, as docs/bringup.md describes.
+Follower limits are the published URDF limits. Star leaders use the ranges the
+Seeed leader integration reads, because the URDF ones are placeholders that stop at
+a quarter turn on joints that travel further. The mapping between reBot and Star
+comes from Seeed's published integration, see default_mapping. None of this has
+been run on physical arms here: confirm it joint by joint as docs/bringup.md says.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import radians
 
 from ._gen import JOINTS, MAX_PAIRS, ArmId, ArmModel, PortId, PortKind
 
@@ -61,6 +63,8 @@ class ArmSpec:
     acceleration_limit: tuple[float, ...] = (10.0, 10.0, 10.0, 15.0, 15.0, 15.0, 15.0)
     kp: tuple[float, ...] = (80.0, 150.0, 150.0, 50.0, 50.0, 50.0, 50.0)
     kd: tuple[float, ...] = (5.0, 10.0, 10.0, 5.0, 4.0, 4.0, 4.0)
+    # Applied to the URDF gravity torque of the six arm joints.
+    gravity_scale: tuple[float, ...] = (1.0,) * 6
     gripper_raw_closed: float = 0.0
     gripper_raw_open: float = 5.0
     notes: str = ""
@@ -101,11 +105,21 @@ REBOT_RS = ArmSpec(
     home=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     urdf="rebot_b601_rs/urdf/ReBot_Arm_RS.urdf",
     end_effector="gripper_end",
+    # Tuned on a real arm by the ReBot RS Digital Twin. Its sweeps measure the model
+    # within 5 to 11 percent on the joints that carry load, see tests/test_kinematics.py.
+    gravity_scale=(1.0, 0.92, 0.98, 1.0, 1.0, 1.0),
     notes="RS06 on joints 1-3, RS00 on joints 4-6 and the gripper. No brakes: never release away from rest.",
 )
 
 _STAR_LOWER = (-2.27, -1.57, -1.57, -1.57, -2.27, -2.27, 0.0)
 _STAR_UPPER = (2.27, 1.57, 1.57, 1.57, 2.27, 2.27, 1.0)
+# Raw servo travel of a leader from its zero pose, in degrees, gripper excluded.
+_STAR_LEADER_LOWER = tuple(radians(v) for v in (-150, -1, -200, -80, -90, -130)) + (0.0,)
+_STAR_LEADER_UPPER = tuple(radians(v) for v in (150, 170, 1, 90, 90, 130)) + (1.0,)
+# Fashion Star's control script maps 60 degrees of trigger onto 90 degrees of FL gripper.
+_STAR_LEADER_GRIPPER_OPEN = radians(60)
+_STAR_URDF_FL = "star_arm_102/fl/urdf/star_arm_102_fl.urdf"
+_STAR_URDF_LEADER = "star_arm_102/ld_hd/urdf/star_arm_102_ld_hd.urdf"
 
 STAR_FL = ArmSpec(
     model=ArmModel.STAR_102_FL,
@@ -120,7 +134,7 @@ STAR_FL = ArmSpec(
     can_guide=False,
     service_period_us=8000,
     home=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-    urdf="star_arm_102/urdf/star_arm_102.urdf",
+    urdf=_STAR_URDF_FL,
     end_effector="gripper_tip",
     gripper_raw_open=1.5708,
     notes="Executing follower.",
@@ -132,16 +146,16 @@ STAR_HD = ArmSpec(
     label="Star Arm 102-HD",
     family="star",
     port_kind=PortKind.UART,
-    lower=_STAR_LOWER,
-    upper=_STAR_UPPER,
+    lower=_STAR_LEADER_LOWER,
+    upper=_STAR_LEADER_UPPER,
     can_execute=False,
     can_hold=True,
     can_guide=False,
     service_period_us=8000,
     home=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-    urdf="star_arm_102/urdf/star_arm_102.urdf",
+    urdf=_STAR_URDF_LEADER,
     end_effector="gripper_tip",
-    gripper_raw_open=1.5708,
+    gripper_raw_open=_STAR_LEADER_GRIPPER_OPEN,
     notes="Pose-holding leader. Carries a button board at servo id 7.",
 )
 
@@ -151,16 +165,16 @@ STAR_LD = ArmSpec(
     label="Star Arm 102-LD",
     family="star",
     port_kind=PortKind.UART,
-    lower=_STAR_LOWER,
-    upper=_STAR_UPPER,
+    lower=_STAR_LEADER_LOWER,
+    upper=_STAR_LEADER_UPPER,
     can_execute=False,
     can_hold=False,
     can_guide=False,
     service_period_us=8000,
     home=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-    urdf="star_arm_102/urdf/star_arm_102.urdf",
+    urdf=_STAR_URDF_LEADER,
     end_effector="gripper_tip",
-    gripper_raw_open=1.5708,
+    gripper_raw_open=_STAR_LEADER_GRIPPER_OPEN,
     notes="Lightweight leader. Read-only: it cannot hold or execute.",
 )
 
@@ -175,36 +189,30 @@ def spec_of(model: int) -> ArmSpec:
         raise ValueError(f"no specification for arm model {model}") from None
 
 
+# Star raw servo angle to reBot RS joint. This is the table in Seeed's integration
+# as the ReBot RS Digital Twin uses it. LeRobot's rebot_102_leader has the same table
+# negated, because its B601 follower counts the other way, and the joint axes of the
+# real URDFs agree once they are compared in the world frame. tests/test_kinematics.py
+# checks that. It is its own inverse, so it also serves reBot leading Star.
+_STAR_RS_DIRECTION = (1.0, 1.0, -1.0, -1.0, -1.0, 1.0)
+
+
 def default_mapping(leader: ArmSpec, follower: ArmSpec) -> dict:
     """Leader to follower mapping for a pair of models.
 
-    Same model: identity. Different models: unit scale, with an offset that puts
-    the two range midpoints together, and the gripper always mapped 0..1 to 0..1.
-    The direction of each joint comes from URDF axes, so a preset is a starting
-    point to confirm against real arms, not a measured value.
+    Every model's zero is its calibration pose, so offsets are zero. Star arms copy
+    each other's raw angles, as Fashion Star's control script does, and a reBot and a
+    Star differ by direction. The gripper is always mapped 0..1 to 0..1.
     """
     scale = [1.0] * JOINTS
-    offset = [0.0] * JOINTS
     if leader.family != follower.family:
-        for j in range(JOINTS - 1):
-            sign = _AXIS_SIGN.get(leader.family, [1] * 6)[j] * _AXIS_SIGN.get(follower.family, [1] * 6)[j]
-            scale[j] = float(sign)
-            mid_leader = (leader.lower[j] + leader.upper[j]) / 2.0
-            mid_follower = (follower.lower[j] + follower.upper[j]) / 2.0
-            offset[j] = mid_follower - scale[j] * mid_leader
+        scale[: JOINTS - 1] = _STAR_RS_DIRECTION
     return {
         "source_joint": list(range(JOINTS)),
         "scale": scale,
-        "offset": offset,
+        "offset": [0.0] * JOINTS,
         "gripper_link": True,
     }
-
-
-# Sign of the URDF axis per joint, read from each published model.
-_AXIS_SIGN = {
-    "rs": [-1, 1, -1, -1, -1, -1],
-    "star": [-1, -1, -1, 1, -1, -1],
-}
 
 
 def dataset_joint_names(bimanual: bool) -> list[str]:

@@ -42,9 +42,26 @@
 #define RS_DAMP_KD_LARGE 4.0f
 #define RS_DAMP_KD_SMALL 1.0f
 
-/* Hand guidance: motors back-drive under a light velocity damping. */
-#define RS_GUIDE_KD_LARGE 0.6f
-#define RS_GUIDE_KD_SMALL 0.15f
+/* Hand guidance, with the values the ReBot RS Digital Twin runs on a real arm: a
+ * weak loop around the measured pose on top of gravity torque. The gains fade in
+ * from position control so that entering guidance is not a step in torque, and
+ * the gripper is left almost free. */
+#define RS_GUIDE_KP 1.5f
+#define RS_GUIDE_KD 1.0f
+#define RS_GUIDE_KD_GRIPPER 0.001f
+#define RS_GUIDE_FADE_US 500000.0f
+
+/* Star leaders turn further than one revolution, and their servos count turns. */
+#define TWO_PI_F 6.2831853f
+
+/* No hand moves a joint this far between two samples. A reading that does is a
+ * reset or a wrong turn count, and a follower must not chase it. 25 degrees. */
+#define LEADER_JUMP_RAD 0.4363f
+
+/* Fashion Star's control script drives FL with these, so they are the ones known
+ * to work: each command is a move over 100 ms, ramping for 50 ms at each end. */
+#define STAR_MOVE_INTERVAL_MS 100u
+#define STAR_MOVE_RAMP_MS 50u
 
 typedef struct {
     uint64_t t_us;
@@ -106,6 +123,7 @@ typedef struct {
 
     float feedforward[J];
     uint64_t ff_expire;
+    uint64_t guide_start;
 
     point_queue_t queue;
     uint8_t paused;
@@ -142,6 +160,7 @@ typedef struct {
     uint64_t raw_ts[J];
 
     fs_parser_t parser;
+    float raw_turn[J]; /* whole turns a Star servo reports beyond the calibrated window */
     uint64_t discover_until;
     uint8_t discover_mask;
     uint8_t discover_dialect;
@@ -438,6 +457,13 @@ static float joint_to_raw(const arm_t *a, int j, float q)
     return a->cal.zero[j] + q / dir;
 }
 
+/* The whole turns in a raw reading, measured from the middle of the joint's range. */
+static float star_turn_of(const arm_t *a, int j, float raw)
+{
+    float middle = (j == GRIPPER) ? 0.5f : 0.5f * (a->cal.lower[j] + a->cal.upper[j]);
+    return TWO_PI_F * (float)lroundf((raw - joint_to_raw(a, j, middle)) / TWO_PI_F);
+}
+
 static float vel_to_joint(const arm_t *a, int j, float raw)
 {
     if (j == GRIPPER) {
@@ -490,6 +516,21 @@ static void port_send_stop_star(port_t *p, uint8_t method)
     }
 }
 
+/* A leader is moved by hand, so it starts released and with its turn count cleared,
+ * as Fashion Star's scripts do. A follower is left alone: it may still be holding
+ * its pose from before a controller restart, and releasing it would drop the arm.
+ * Reading through star_turn_of copes with whatever turn count it has. */
+static void port_prepare_star_leader(port_t *p)
+{
+    uint8_t buf[16];
+    size_t n = fs_encode_stop(buf, FS_BROADCAST_ID, FS_STOP_RELEASE, 0);
+    if (!rac_port_uart_send(p->bus, buf, n)) p->tx_errors++;
+    p->tx_bytes_window += (uint32_t)n;
+    n = fs_encode_reset_turns(buf, FS_BROADCAST_ID);
+    if (!rac_port_uart_send(p->bus, buf, n)) p->tx_errors++;
+    p->tx_bytes_window += (uint32_t)n;
+}
+
 static void port_send_rs_all(port_t *p, bool enable)
 {
     for (uint8_t i = 0; i < J; i++) {
@@ -528,6 +569,9 @@ static void arm_apply_torque(arm_t *a, bool enable)
 
 static void arm_set_motion(arm_t *a, uint8_t motion)
 {
+    if (motion == MOTION_GUIDE && a->motion != MOTION_GUIDE) {
+        a->guide_start = g.now;
+    }
     a->motion = motion;
     if (motion == MOTION_NONE) {
         if (a->torque_on) {
@@ -696,6 +740,10 @@ static uint8_t port_bind(uint8_t index, uint8_t arm_id, uint8_t model, uint8_t d
         rac_port_uart_set_baud(p->bus, baud);
     }
     memset(p->raw_ts, 0, sizeof(p->raw_ts));
+    memset(p->raw_turn, 0, sizeof(p->raw_turn));
+    if (p->kind == RAC_PORT_KIND_UART && a->is_leader) {
+        port_prepare_star_leader(p);
+    }
     p->next_service = g.now;
     p->next_read = g.now;
     return RAC_ACK_OK;
@@ -877,9 +925,23 @@ static void port_close_cycle(port_t *p, uint64_t now)
     a->fault_mask = fault;
 
     uint8_t valid = p->cycle_mask;
+    bool jumped = false;
     for (int j = 0; j < J; j++) {
         if (valid & (1u << j)) {
-            a->position[j] = raw_to_joint(a, j, p->raw_position[j]);
+            float raw = p->raw_position[j];
+            if (p->kind == RAC_PORT_KIND_UART) {
+                /* Commands have to stay on the turn the servo is on, so the turn
+                 * is only read again while no command is being sent. */
+                if (a->motion != MOTION_POSITION) {
+                    p->raw_turn[j] = star_turn_of(a, j, raw);
+                }
+                raw -= p->raw_turn[j];
+            }
+            float q = raw_to_joint(a, j, raw);
+            if (j != GRIPPER && (a->valid_mask & (1u << j)) && fabsf(q - a->position[j]) > LEADER_JUMP_RAD) {
+                jumped = true;
+            }
+            a->position[j] = q;
             a->velocity[j] = vel_to_joint(a, j, p->raw_velocity[j]);
             a->torque[j] = p->raw_torque[j];
             a->temperature[j] = p->raw_temperature[j];
@@ -929,6 +991,10 @@ static void port_close_cycle(port_t *p, uint64_t now)
     }
     /* A faulted leader cannot be followed either. */
     if (lost && a->is_leader) {
+        pairs_stop_for_arm(arm_id);
+    }
+    if (jumped && a->is_leader && a->pair != 0xFFu && g.pairs[a->pair].phase != RAC_PAIR_OFF) {
+        send_event(RAC_EVT_LEADER_JUMP, arm_id, 2, a->pair, 0);
         pairs_stop_for_arm(arm_id);
     }
 }
@@ -1097,6 +1163,11 @@ static void arm_compute_target(arm_t *a, uint64_t now, float dt)
 
 /* ---------------------------------------------------------------- dispatchers */
 
+/* Seeed's RS follower gains, which it pairs with gravity torque when following a
+ * leader. Softer than position control, because a hand can ask for anything. */
+static const float RS_FOLLOW_KP[J] = {50, 50, 50, 30, 50, 50, 50};
+static const float RS_FOLLOW_KD[J] = {3, 5, 5, 3, 4, 4, 4};
+
 static void service_rs(port_t *p, uint64_t now)
 {
     arm_t *a = &g.arms[p->arm];
@@ -1144,15 +1215,29 @@ static void service_rs(port_t *p, uint64_t now)
             } else if (a->cal.direction[i] < 0.0f) {
                 raw_vel = -raw_vel;
             }
-            rs_encode_motion(&f, p->dialect, type, id, raw, raw_vel, a->limits.kp[i], a->limits.kd[i], tau);
+            float kp = a->limits.kp[i];
+            float kd = a->limits.kd[i];
+            if (a->mode == RAC_MODE_LOCAL_TELEOP) {
+                if (kp > RS_FOLLOW_KP[i]) kp = RS_FOLLOW_KP[i];
+                if (kd > RS_FOLLOW_KD[i]) kd = RS_FOLLOW_KD[i];
+            }
+            rs_encode_motion(&f, p->dialect, type, id, raw, raw_vel, kp, kd, tau);
             break;
         }
         case MOTION_GUIDE: {
-            float kd = (i < 3) ? RS_GUIDE_KD_LARGE : RS_GUIDE_KD_SMALL;
-            /* If the host stops refreshing gravity torque the arm must not be
-             * left unsupported, so damping rises to the stop value. */
-            if (!ff_fresh) kd = (i < 3) ? RS_DAMP_KD_LARGE : RS_DAMP_KD_SMALL;
-            rs_encode_motion(&f, p->dialect, type, id, 0.0f, 0.0f, 0.0f, kd, tau);
+            if (!ff_fresh) {
+                /* If the host stops refreshing gravity torque the arm must not
+                 * be left unsupported, so damping rises to the stop value. */
+                float kd = (i < 3) ? RS_DAMP_KD_LARGE : RS_DAMP_KD_SMALL;
+                rs_encode_motion(&f, p->dialect, type, id, 0.0f, 0.0f, 0.0f, kd, tau);
+            } else if (i == GRIPPER) {
+                rs_encode_motion(&f, p->dialect, type, id, 0.0f, 0.0f, 0.0f, RS_GUIDE_KD_GRIPPER, tau);
+            } else {
+                float s = clampf((float)(now - a->guide_start) / RS_GUIDE_FADE_US, 0.0f, 1.0f);
+                float kp = a->limits.kp[i] + s * (RS_GUIDE_KP - a->limits.kp[i]);
+                float kd = a->limits.kd[i] + s * (RS_GUIDE_KD - a->limits.kd[i]);
+                rs_encode_motion(&f, p->dialect, type, id, p->raw_position[i], 0.0f, kp, kd, tau);
+            }
             break;
         }
         case MOTION_DAMP:
@@ -1196,11 +1281,10 @@ static void service_star(port_t *p, uint64_t now)
         float degrees[STAR_IDS];
         arm_compute_target(a, now, dt);
         for (int j = 0; j < J; j++) {
-            degrees[j] = joint_to_raw(a, j, a->target[j]) * 180.0f / PI_F;
+            degrees[j] = (joint_to_raw(a, j, a->target[j]) + p->raw_turn[j]) * 180.0f / PI_F;
         }
-        uint32_t interval_ms = p->service_period_us / 1000u;
-        if (interval_ms == 0) interval_ms = 1;
-        size_t n = fs_encode_sync_angle(buf, ids, degrees, STAR_IDS, interval_ms, 0);
+        size_t n = fs_encode_sync_angle(buf, ids, degrees, STAR_IDS, STAR_MOVE_INTERVAL_MS, STAR_MOVE_RAMP_MS,
+                                        STAR_MOVE_RAMP_MS, 0);
         if (!rac_port_uart_send(p->bus, buf, n)) p->tx_errors++;
         p->tx_bytes_window += (uint32_t)n;
         a->target_seq++;

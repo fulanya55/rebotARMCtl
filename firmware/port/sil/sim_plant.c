@@ -23,6 +23,7 @@ typedef struct {
     uint8_t enabled;
     uint8_t online;
     uint8_t star_mode; /* 0 released, 1 position, 2 damped */
+    int16_t turns;     /* whole turns a real servo may report on top of its angle */
 } sim_motor_t;
 
 typedef struct {
@@ -267,27 +268,35 @@ static void star_request(uint8_t port_index, const uint8_t *frame, uint64_t at)
             for (uint8_t i = 0; i < count; i++) {
                 uint8_t id = r[i];
                 if (id >= J || !p->motors[id].online) continue;
-                size_t n = fs_build_monitor_response(out, id, p->motors[id].pos * 180.0f / PI_F);
+                size_t n = fs_build_monitor_response(out, id, (p->motors[id].pos * 180.0f / PI_F) + 360.0f * (float)p->motors[id].turns);
                 uint64_t start = p->busy_until > at ? p->busy_until : at;
                 p->busy_until = start + n * UART_BYTE_US + SERVO_REPLY_DELAY_US;
                 uart_reply(port_index, out, n, start + SERVO_REPLY_DELAY_US);
             }
-        } else if (inner == FS_CODE_SET_ANGLE_MTURN && record == 11) {
+        } else if (inner == FS_CODE_SET_ANGLE_MTURN_INTERVAL && record == 15) {
             for (uint8_t i = 0; i < count; i++, r += record) {
                 uint8_t id = r[0];
                 if (id >= J || !p->motors[id].online) continue;
                 int32_t tenths = (int32_t)((uint32_t)r[1] | ((uint32_t)r[2] << 8) | ((uint32_t)r[3] << 16) |
                                            ((uint32_t)r[4] << 24));
-                p->motors[id].goal = (float)tenths * 0.1f * PI_F / 180.0f;
+                p->motors[id].goal = ((float)tenths * 0.1f - 360.0f * (float)p->motors[id].turns) * PI_F / 180.0f;
                 p->motors[id].star_mode = 1;
                 p->motors[id].enabled = 1;
             }
         }
     } else if (code == FS_CODE_STOP_ON_CONTROL && size >= 2) {
         uint8_t id = params[0];
-        if (id < J) {
-            p->motors[id].star_mode = params[1] == FS_STOP_HOLD ? 1u : (params[1] == FS_STOP_DAMP ? 2u : 0u);
-            p->motors[id].enabled = p->motors[id].star_mode == 1;
+        for (uint8_t i = 0; i < J; i++) {
+            if (id == i || id == FS_BROADCAST_ID) {
+                p->motors[i].star_mode = params[1] == FS_STOP_HOLD ? 1u : (params[1] == FS_STOP_DAMP ? 2u : 0u);
+                p->motors[i].enabled = p->motors[i].star_mode == 1;
+            }
+        }
+    } else if (code == FS_CODE_RESET_TURNS && size >= 1) {
+        for (uint8_t i = 0; i < J; i++) {
+            if (params[0] == i || params[0] == FS_BROADCAST_ID) {
+                p->motors[i].turns = 0;
+            }
         }
     }
 }
@@ -353,7 +362,8 @@ static float gravity_torque(int joint, float q)
 static void step_motor(sim_port_t *p, int j, float dt, float hand)
 {
     sim_motor_t *m = &p->motors[j];
-    bool hand_moved = p->hand_active && !(m->enabled && m->kp > 0.0f);
+    /* A hand back-drives a weak loop, such as hand guidance, but not position control. */
+    bool hand_moved = p->hand_active && !(m->enabled && m->kp > 10.0f);
 
     if (p->model == RAC_MODEL_REBOT_B601_RS) {
         if (hand_moved) {
@@ -510,6 +520,22 @@ void sim_inject(const rac_sil_inject_t *m)
     default:
         break;
     }
+}
+
+void sim_set_position(uint8_t port, uint8_t joint, float position)
+{
+    ports[port].motors[joint].pos = position;
+}
+
+void sim_motor_gains(uint8_t port, uint8_t joint, float *kp, float *kd)
+{
+    *kp = ports[port].motors[joint].kp;
+    *kd = ports[port].motors[joint].kd;
+}
+
+void sim_set_turns(uint8_t port, uint8_t joint, int16_t turns)
+{
+    ports[port].motors[joint].turns = turns;
 }
 
 float sim_motor_position(uint8_t port, uint8_t joint)

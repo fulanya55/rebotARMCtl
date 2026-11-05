@@ -374,13 +374,22 @@ static void test_fashionstar_frames(void)
     CHECK(b[4] == FS_CODE_MONITOR && b[5] == 1 && b[6] == 3);
     CHECK(n == 11);
 
-    /* Sync angle: 11 byte records, angle little endian in tenths of a degree. */
+    /* Sync angle, the same bytes as struct.pack("<BlLHHH", id, tenths, 100, 50, 50, 0)
+     * in Fashion Star's control script, sent as command 14 with 15 byte records. */
     float deg[1] = {-12.5f};
     static const uint8_t one[1] = {4};
-    n = fs_encode_sync_angle(b, one, deg, 1, 8, 0);
-    CHECK(b[4] == FS_CODE_SET_ANGLE_MTURN && b[5] == 11 && b[6] == 1 && b[7] == 4);
+    n = fs_encode_sync_angle(b, one, deg, 1, 100, 50, 50, 0);
+    CHECK(n == 23);
+    CHECK(b[4] == 14 && b[5] == 15 && b[6] == 1 && b[7] == 4);
     int32_t tenths = (int32_t)((uint32_t)b[8] | ((uint32_t)b[9] << 8) | ((uint32_t)b[10] << 16) | ((uint32_t)b[11] << 24));
     CHECK(tenths == -125);
+    CHECK(b[12] == 100 && b[13] == 0 && b[14] == 0 && b[15] == 0);
+    CHECK(b[16] == 50 && b[17] == 0 && b[18] == 50 && b[19] == 0);
+    CHECK(b[20] == 0 && b[21] == 0);
+
+    /* Reset the turn count on every servo: command 17, as the C SDK sends it. */
+    n = fs_encode_reset_turns(b, FS_BROADCAST_ID);
+    CHECK(n == 6 && b[2] == 17 && b[3] == 1 && b[4] == 0xFF);
 
     /* A monitor response parses through the byte parser, one byte at a time. */
     fs_parser_t parser;
@@ -959,6 +968,126 @@ static void test_mit_dialect(void)
     CHECK(last_state[RAC_ARM_LEFT_FOLLOWER].valid_mask == 0x7F);
 }
 
+/* Star servos count turns, and a reading on another turn is still the same pose. */
+static void test_star_turn_count(void)
+{
+    setup("test_star_turn_count", RAC_MODEL_REBOT_B601_RS, RAC_MODEL_NONE, RAC_MODEL_STAR_102_LD, RAC_MODEL_STAR_102_FL);
+    run_ms(5);
+
+    /* A count left from an earlier session is cleared when a leader is bound. */
+    sim_set_turns(2, 1, 3);
+    bind(0, RAC_ARM_LEFT_FOLLOWER, RAC_MODEL_REBOT_B601_RS);
+    bind(2, RAC_ARM_LEFT_LEADER, RAC_MODEL_STAR_102_LD);
+    pairing(0, RAC_ARM_LEFT_LEADER, RAC_ARM_LEFT_FOLLOWER, 1.0f);
+    run_ms(150);
+    CHECK_NEAR(last_state[RAC_ARM_LEFT_LEADER].position[1], 0.0f, 0.01f);
+
+    float pose[J] = {0.3f, 0, 0, 0, 0, 0, 0};
+    hand_pose(2, pose);
+    run_ms(1500);
+    generation = 1;
+    set_mode(RAC_MODE_LOCAL_TELEOP, (1u << RAC_ARM_LEFT_LEADER) | (1u << RAC_ARM_LEFT_FOLLOWER), RAC_SOURCE_TELEOP);
+    teleop(RAC_TELEOP_ALIGN, RAC_FOLLOW_ABSOLUTE, 1);
+    run_ms(3000);
+    teleop(RAC_TELEOP_START, RAC_FOLLOW_ABSOLUTE, 1);
+    run_ms(500);
+    CHECK(last_status.pair_phase[0] == RAC_PAIR_FOLLOWING);
+
+    /* A leader that reports another turn mid-session is read in the same place. */
+    sim_set_turns(2, 0, -2);
+    run_ms(500);
+    CHECK_NEAR(last_state[RAC_ARM_LEFT_LEADER].position[0], 0.3f, 0.02f);
+    CHECK_NEAR(sim_motor_position(0, 0), 0.3f, 0.03f);
+    CHECK(last_status.pair_phase[0] == RAC_PAIR_FOLLOWING);
+    CHECK(event_counts[RAC_EVT_LEADER_JUMP] == 0);
+
+    /* A follower on another turn holds where it is, rather than spinning a full
+     * turn back to the angle its reading was reduced to. */
+    sim_set_turns(3, 2, 1);
+    bind(3, RAC_ARM_RIGHT_FOLLOWER, RAC_MODEL_STAR_102_FL);
+    CHECK(last_ack.status == RAC_ACK_OK);
+    run_ms(150);
+    CHECK_NEAR(last_state[RAC_ARM_RIGHT_FOLLOWER].position[2], 0.0f, 0.01f);
+    set_mode(RAC_MODE_HOST_TARGET, 1u << RAC_ARM_RIGHT_FOLLOWER, RAC_SOURCE_TEACH);
+    CHECK(last_ack.status == RAC_ACK_OK);
+    run_ms(1000);
+    CHECK(last_state[RAC_ARM_RIGHT_FOLLOWER].flags & RAC_STATE_TORQUE_ON);
+    CHECK_NEAR(sim_motor_position(3, 2), 0.0f, 0.02f);
+}
+
+/* A reading that moves further than a hand can is not followed. */
+static void test_leader_jump_stops_following(void)
+{
+    setup("test_leader_jump_stops_following", RAC_MODEL_REBOT_B601_RS, RAC_MODEL_NONE, RAC_MODEL_STAR_102_LD, RAC_MODEL_NONE);
+    run_ms(5);
+    bind(0, RAC_ARM_LEFT_FOLLOWER, RAC_MODEL_REBOT_B601_RS);
+    bind(2, RAC_ARM_LEFT_LEADER, RAC_MODEL_STAR_102_LD);
+    pairing(0, RAC_ARM_LEFT_LEADER, RAC_ARM_LEFT_FOLLOWER, 1.0f);
+    run_ms(150);
+    generation = 1;
+    set_mode(RAC_MODE_LOCAL_TELEOP, (1u << RAC_ARM_LEFT_LEADER) | (1u << RAC_ARM_LEFT_FOLLOWER), RAC_SOURCE_TELEOP);
+    teleop(RAC_TELEOP_ALIGN, RAC_FOLLOW_ABSOLUTE, 1);
+    run_ms(500);
+    teleop(RAC_TELEOP_START, RAC_FOLLOW_ABSOLUTE, 1);
+    run_ms(500);
+    CHECK(last_status.pair_phase[0] == RAC_PAIR_FOLLOWING);
+    float before = sim_motor_position(0, 0);
+
+    sim_set_position(2, 0, 0.8f);
+    run_ms(100);
+    CHECK(event_counts[RAC_EVT_LEADER_JUMP] == 1);
+    CHECK(last_status.pair_phase[0] == RAC_PAIR_OFF);
+
+    run_ms(1000);
+    CHECK_NEAR(sim_motor_position(0, 0), before, 0.03f);
+    CHECK(last_state[RAC_ARM_LEFT_FOLLOWER].flags & RAC_STATE_TORQUE_ON);
+}
+
+static void test_guide_and_follow_gains(void)
+{
+    setup("test_guide_and_follow_gains", RAC_MODEL_REBOT_B601_RS, RAC_MODEL_REBOT_B601_RS, RAC_MODEL_NONE, RAC_MODEL_NONE);
+    run_ms(5);
+    bind(0, RAC_ARM_LEFT_LEADER, RAC_MODEL_REBOT_B601_RS);
+    bind(1, RAC_ARM_LEFT_FOLLOWER, RAC_MODEL_REBOT_B601_RS);
+    run_ms(150);
+
+    rac_feedforward_t f;
+    memset(&f, 0, sizeof(f));
+    f.valid_ms = 200;
+    float kp, kd;
+
+    /* Guidance starts from position gains and fades, so there is no torque step. */
+    generation = 1;
+    send_msg(RAC_MSG_FEEDFORWARD, RAC_ARM_LEFT_LEADER, &f, sizeof(f));
+    set_mode(RAC_MODE_GUIDE, 1u << RAC_ARM_LEFT_LEADER, RAC_SOURCE_GUIDE);
+    CHECK(last_ack.status == RAC_ACK_OK);
+    run_ms(20);
+    sim_motor_gains(0, 1, &kp, &kd);
+    CHECK(kp > 100.0f);
+    for (int i = 0; i < 4; i++) {
+        send_msg(RAC_MSG_FEEDFORWARD, RAC_ARM_LEFT_LEADER, &f, sizeof(f));
+        run_ms(150);
+    }
+    sim_motor_gains(0, 1, &kp, &kd);
+    CHECK_NEAR(kp, 1.5f, 0.1f);
+    CHECK_NEAR(kd, 1.0f, 0.01f);
+    sim_motor_gains(0, 6, &kp, &kd);
+    CHECK_NEAR(kp, 0.0f, 0.01f);
+    CHECK_NEAR(kd, 0.001f, 0.001f);
+
+    /* Following a leader uses Seeed's softer gains. */
+    pairing(0, RAC_ARM_LEFT_LEADER, RAC_ARM_LEFT_FOLLOWER, 1.0f);
+    set_mode(RAC_MODE_LOCAL_TELEOP, 1u << RAC_ARM_LEFT_FOLLOWER, RAC_SOURCE_TELEOP);
+    CHECK(last_ack.status == RAC_ACK_OK);
+    run_ms(50);
+    sim_motor_gains(1, 1, &kp, &kd);
+    CHECK_NEAR(kp, 50.0f, 0.1f);
+    CHECK_NEAR(kd, 5.0f, 0.01f);
+    sim_motor_gains(1, 3, &kp, &kd);
+    CHECK_NEAR(kp, 30.0f, 0.1f);
+    CHECK_NEAR(kd, 3.0f, 0.01f);
+}
+
 static void test_time_sync(void)
 {
     setup("test_time_sync", RAC_MODEL_NONE, RAC_MODEL_NONE, RAC_MODEL_NONE, RAC_MODEL_NONE);
@@ -988,6 +1117,9 @@ int main(void)
     test_four_arms_together();
     test_guide_needs_fresh_feedforward();
     test_star_follower_executes();
+    test_star_turn_count();
+    test_leader_jump_stops_following();
+    test_guide_and_follow_gains();
     test_mit_dialect();
     test_time_sync();
 

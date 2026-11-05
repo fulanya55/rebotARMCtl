@@ -1,9 +1,8 @@
 /*
  * Fashion Star UART servo driver for the Star Arm 102 (half-duplex, 1 Mbit/s).
  *
- * Written from the published protocol. The STM32 SDK in
- * servodevelop/servo-uart-rs485-sdk declares no license, so no code is taken
- * from it. See docs/LICENSE_AUDIT.md.
+ * Frames checked against the STM32 SDK in servodevelop/servo-uart-rs485-sdk and
+ * the commands against Fashion Star's control script for the 102 arms.
  *
  * Frame:    header(2) code(1) size(1) params(size) checksum(1)
  * Request:  header 0x12 0x4C.  Response: header 0x05 0x1C.
@@ -18,7 +17,8 @@
 #include <stdint.h>
 
 #define FS_CODE_PING 1u
-#define FS_CODE_SET_ANGLE_MTURN 13u
+#define FS_CODE_SET_ANGLE_MTURN_INTERVAL 14u
+#define FS_CODE_RESET_TURNS 17u
 #define FS_CODE_DAMPING 9u
 #define FS_CODE_MONITOR 22u
 #define FS_CODE_STOP_ON_CONTROL 24u
@@ -31,6 +31,8 @@
 
 /* The servo reports this angle when it has no valid reading. */
 #define FS_MONITOR_INVALID_ANGLE (-235929599)
+
+#define FS_BROADCAST_ID 0xFFu
 
 #define FS_MAX_FRAME 128u
 
@@ -51,9 +53,12 @@ size_t fs_encode_sync_monitor(uint8_t *out, const uint8_t *ids, uint8_t count);
 
 /* Synchronous multi-turn position command, so one frame moves the whole arm at once. */
 size_t fs_encode_sync_angle(uint8_t *out, const uint8_t *ids, const float *degrees, uint8_t count,
-                            uint32_t interval_ms, uint16_t power_mw);
+                            uint32_t interval_ms, uint16_t accel_ms, uint16_t decel_ms, uint16_t power_mw);
 
 size_t fs_encode_stop(uint8_t *out, uint8_t servo_id, uint8_t method, uint16_t power_mw);
+
+/* Clear the turn count, so the servo reads its angle within one revolution again. */
+size_t fs_encode_reset_turns(uint8_t *out, uint8_t servo_id);
 
 /* Convert the servo's NTC reading to degrees Celsius. */
 float fs_temperature_c(uint16_t raw);

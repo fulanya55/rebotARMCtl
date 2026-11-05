@@ -15,13 +15,28 @@ import { useApi } from "@/contexts/ApiContext";
 import { useController } from "@/contexts/ControllerContext";
 
 const ARM_JOINTS = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"];
+const RAC_STATE_TORQUE_ON = 0x08;
 
-/** Normalized gripper travel to the model's prismatic fingers, where the URDF has them. */
+// How far a Star finger opens on the model, in radians.
+const STAR_FINGER_TRAVEL = 0.6;
+
+/** Normalized gripper travel to the model's fingers: prismatic on reBot, hinged on Star. */
 function applyGripper(robot: URDFRobot, value: number) {
   for (const [name, joint] of Object.entries(robot.joints)) {
     if (name.startsWith("gripper_joint") && joint.limit) {
       joint.setJointValue(Number(joint.limit.upper) * value);
     }
+  }
+  // Which way opens comes from the finger meshes. On FL the right finger mimics the left
+  // and negative opens. On HD and LD each is declared separately and the left opens positive.
+  const left = robot.joints.joint7_left;
+  const right = robot.joints.joint7_right;
+  if (!left || !right) return;
+  if ("mimicJoint" in right) {
+    left.setJointValue(-value * STAR_FINGER_TRAVEL);
+  } else {
+    left.setJointValue(value * STAR_FINGER_TRAVEL);
+    right.setJointValue(-value * STAR_FINGER_TRAVEL);
   }
 }
 
@@ -29,6 +44,43 @@ function applyPose(robot: URDFRobot | null, pose: number[] | undefined) {
   if (!robot || !pose) return;
   ARM_JOINTS.forEach((name, index) => robot.joints[name]?.setJointValue(pose[index]));
   applyGripper(robot, pose[6] ?? 0);
+}
+
+// Feedback shown on the solid model, smoothed the way the ReBot RS Digital Twin does:
+// a low-pass whose cutoff rises with speed, so it settles at rest and keeps up in motion.
+const FEEDBACK_MIN_CUTOFF_HZ = 3;
+const FEEDBACK_SPEED_BETA = 4;
+const FEEDBACK_DERIVATIVE_CUTOFF_HZ = 1;
+const FEEDBACK_DEADBAND_RAD = 0.0025;
+
+const lowPassAlpha = (cutoffHz: number, dt: number) => 1 - Math.exp(-2 * Math.PI * cutoffHz * dt);
+
+function makeFeedbackFilter() {
+  const states: { raw: number; value: number; derivative: number }[] = [];
+  return (pose: number[], dtSeconds: number) => {
+    const dt = Math.min(0.2, Math.max(0.005, dtSeconds));
+    return pose.map((raw, index) => {
+      const state = states[index];
+      if (!state) {
+        states[index] = { raw, value: raw, derivative: 0 };
+        return raw;
+      }
+      state.derivative += lowPassAlpha(FEEDBACK_DERIVATIVE_CUTOFF_HZ, dt) * ((raw - state.raw) / dt - state.derivative);
+      state.raw = raw;
+      if (Math.abs(raw - state.value) > FEEDBACK_DEADBAND_RAD) {
+        const cutoff = FEEDBACK_MIN_CUTOFF_HZ + FEEDBACK_SPEED_BETA * Math.abs(state.derivative);
+        state.value += lowPassAlpha(cutoff, dt) * (raw - state.value);
+      }
+      return state.value;
+    });
+  };
+}
+
+/** The URDF limits of the Star models stop at a quarter turn on joints that travel further. */
+function showTrueAngles(robot: URDFRobot) {
+  Object.values(robot.joints).forEach((joint) => {
+    joint.ignoreLimits = true;
+  });
 }
 
 function makeGhost(root: THREE.Object3D) {
@@ -144,6 +196,7 @@ const RobotView3D: React.FC<Props> = ({ arm, urdf, endEffector, target, onJointD
       url,
       (robot) => {
         if (disposed) return;
+        showTrueAngles(robot);
         measured = robot;
         world.add(robot);
       },
@@ -154,6 +207,7 @@ const RobotView3D: React.FC<Props> = ({ arm, urdf, endEffector, target, onJointD
     ghostLoader.loadMeshCb = loader.loadMeshCb;
     ghostLoader.load(url, (robot) => {
       if (disposed) return;
+      showTrueAngles(robot);
       ghost = robot;
       world.add(robot);
       dragControls = new PointerURDFDragControls(robot, camera, renderer.domElement);
@@ -172,6 +226,14 @@ const RobotView3D: React.FC<Props> = ({ arm, urdf, endEffector, target, onJointD
     });
     manager.onLoad = () => {
       if (ghost) makeGhost(ghost);
+      // A Star arm is about half the size of a reBot, so frame whichever this is.
+      if (measured) {
+        const box = new THREE.Box3().setFromObject(measured);
+        const center = box.getCenter(new THREE.Vector3());
+        orbit.target.copy(center);
+        camera.position.copy(center).add(new THREE.Vector3(1, 0.8, 1).normalize().multiplyScalar(box.getSize(new THREE.Vector3()).length() * 1.4));
+        orbit.update();
+      }
     };
 
     const tip = new THREE.Vector3();
@@ -190,11 +252,18 @@ const RobotView3D: React.FC<Props> = ({ arm, urdf, endEffector, target, onJointD
     observer.observe(host);
     resize();
 
+    const filterFeedback = makeFeedbackFilter();
+    let lastFrame = performance.now();
+
     const animate = () => {
       frame = requestAnimationFrame(animate);
       const sample = samplesRef.current[arm];
-      applyPose(measured, sample?.position);
-      const wanted = targetRef.current ?? sample?.target ?? sample?.position;
+      const frameTime = performance.now();
+      if (sample?.position) applyPose(measured, filterFeedback(sample.position, (frameTime - lastFrame) / 1000));
+      lastFrame = frameTime;
+      // With torque off there is no target, and the field holds a stale value.
+      const energized = !!sample && (sample.flags & RAC_STATE_TORQUE_ON) !== 0;
+      const wanted = targetRef.current ?? (energized ? sample.target : sample?.position);
       applyPose(ghost, wanted);
 
       transform.enabled = interactiveRef.current;

@@ -175,8 +175,8 @@ class TestTeleop:
         client.teleop_start()
         client.sil_inject("SET_HAND_POSE", arg=2, values=[-0.2, 0.4, 0.4, 0.2, -0.2, 0.3, 0.2])
         rig.wait(lambda: abs(rig.arm("left_follower")["position"][0] + 0.2) < 0.05, what="following")
-        # The leader's raw 0.2 rad over its 1.5708 rad travel is 0.127 of the range.
-        assert rig.arm("left_follower")["position"][6] == pytest.approx(0.2 / 1.5708, abs=0.05)
+        # The leader's raw 0.2 rad over its 60 degrees of travel is 0.19 of the range.
+        assert rig.arm("left_follower")["position"][6] == pytest.approx(0.2 / np.radians(60), abs=0.05)
 
         # Sync timing is reported by the controller, on its own grid.
         pair = rig.status()["pairs"][0]
@@ -235,8 +235,9 @@ class TestTeleop:
     def test_presets_cover_cross_model_pairs(self, bound_rig):
         config = bound_rig.client.teleop_config()
         assert config["pairs"]["0"]["preset"] is True
-        # J2's ranges differ by half a turn of offset between the two arms.
-        assert config["pairs"]["0"]["offset"][1] == pytest.approx(1.57, abs=0.01)
+        # Seeed's Star to reBot directions. Both arms count from their calibration pose.
+        assert config["pairs"]["0"]["scale"] == [1.0, 1.0, -1.0, -1.0, -1.0, 1.0, 1.0]
+        assert config["pairs"]["0"]["offset"] == [0.0] * 7
 
     def test_two_pairs_run_together(self, rig):
         client = rig.client
@@ -350,6 +351,26 @@ class TestExecution:
             time.sleep(0.02)
         time.sleep(0.8)
         assert rig.arm("left_follower")["position"][0] == pytest.approx(0.3, abs=0.05)
+
+    def test_a_target_step_is_smoothed(self, bound_rig):
+        """A slider dragged across its range still starts gently."""
+        rig = bound_rig
+        rig.client.set_target("left_follower", [0.8] + [0.0] * 5 + [0.5])
+        time.sleep(0.12)
+        # At the 4 rad/s2 limit this much time covers about 3 cm of a radian.
+        assert abs(rig.arm("left_follower")["target"][0]) < 0.08
+        rig.wait(lambda: abs(rig.arm("left_follower")["target"][0] - 0.8) < 0.01, timeout=5, what="target reached")
+
+    def test_stopping_ends_a_live_target(self, bound_rig):
+        rig = bound_rig
+        rig.client.set_target("left_follower", [0.8] + [0.0] * 5 + [0.5])
+        time.sleep(0.2)
+        rig.client.call("run.stop", kind="hold")
+        time.sleep(0.1)
+        held = rig.arm("left_follower")["target"][0]
+        time.sleep(0.4)
+        assert rig.arm("left_follower")["target"][0] == pytest.approx(held, abs=0.02)
+        assert abs(held - 0.8) > 0.1
 
     def test_a_finished_move_settles_into_hold(self, bound_rig):
         rig = bound_rig

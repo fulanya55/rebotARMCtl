@@ -18,4 +18,13 @@ reBot Arm B601-RS description (assets/robots/rebot_b601_rs)
   Licensed under CERN-OHL-W-2.0. See assets/robots/rebot_b601_rs/LICENSE.CERN-OHL-W-2.0.
   Source: https://github.com/Seeed-Projects/reBot-DevArm at 5265303.
 
-See docs/LICENSE_AUDIT.md for what each upstream project contributes and how.
+Star Arm 102 description (assets/robots/star_arm_102)
+  From https://github.com/servodevelop/Star-Arm-102 at 24e463b.
+  No redistribution grant. Included for personal study only.
+
+ReBot Arm Digital Twin RS (motion profiles, display filter, gravity data and report)
+  From https://github.com/Yang-Ci/ReBot_Arm_DigitalTwin_RS at 84c1ea7.
+  No license declared. Included for personal study only.
+
+See docs/LICENSE_AUDIT.md for what each upstream project contributes and how, and
+for what must be removed before this repository could be made public.

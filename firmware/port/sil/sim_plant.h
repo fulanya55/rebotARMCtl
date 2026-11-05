@@ -30,6 +30,9 @@ void sim_set_host_sink(sim_host_sink_t sink);
 /* Inspection and fault injection, also reachable through SIL_INJECT. */
 void sim_inject(const rac_sil_inject_t *m);
 float sim_motor_position(uint8_t port, uint8_t joint);
+void sim_set_turns(uint8_t port, uint8_t joint, int16_t turns);
+void sim_set_position(uint8_t port, uint8_t joint, float position);
+void sim_motor_gains(uint8_t port, uint8_t joint, float *kp, float *kd);
 uint32_t sim_can_frames_sent(uint8_t bus);
 
 #endif /* SIM_PLANT_H */

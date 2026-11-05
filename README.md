@@ -69,4 +69,4 @@ Lab 自带的测试要在 `apps/lab` 目录下运行，并设置 `PYTHONUTF8=1`�
 
 ## 许可
 
-本仓库代码使用 Apache-2.0，`assets/robots/rebot_b601_rs` 沿用其 CERN-OHL-W-2.0，内嵌的 Lab 保留其上游许可。复用了哪些项目、以什么方式复用、还有哪些授权需要确认，都写在 [docs/LICENSE_AUDIT.md](docs/LICENSE_AUDIT.md)。
+本仓库只用于个人学习，**请保持私有**：里面有几项上游没有授予再分发权利的文件。复用了哪些项目、公开前要清掉什么，都写在 [docs/LICENSE_AUDIT.md](docs/LICENSE_AUDIT.md)。代码暂定 Apache-2.0，`assets/robots/rebot_b601_rs` 沿用其 CERN-OHL-W-2.0，内嵌的 Lab 保留其上游许可。

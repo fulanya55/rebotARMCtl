@@ -139,6 +139,7 @@
 #define RAC_EVT_QUEUE_CLEARED 0x10 /* arg0: points dropped */
 #define RAC_EVT_OVERRUN 0x11 /* arg0: microseconds late */
 #define RAC_EVT_LEADER_STALE 0x12 /* arg0: pair index */
+#define RAC_EVT_LEADER_JUMP 0x13 /* arg0: pair index. The reading jumped, so following stopped */
 
 /* EstopState */
 #define RAC_ESTOP_CLEAR 0x00

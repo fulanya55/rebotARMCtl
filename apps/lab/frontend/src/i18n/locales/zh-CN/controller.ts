@@ -68,6 +68,7 @@ export default {
     queue_underrun: "动作队列已空，保持当前目标",
     stale_rejected: "已拒绝旧代次指令",
     leader_stale: "主臂数据中断，从臂保持",
+    leader_jump: "主臂读数突变，已停止跟随，请检查零位后重新连接",
     estop_reset: "急停已复位",
   },
   common: {

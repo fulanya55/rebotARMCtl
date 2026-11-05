@@ -193,6 +193,7 @@ ENUMS: dict[str, tuple[str, list[tuple[str, int, str]]]] = {
             ("QUEUE_CLEARED", 16, "arg0: points dropped"),
             ("OVERRUN", 17, "arg0: microseconds late"),
             ("LEADER_STALE", 18, "arg0: pair index"),
+            ("LEADER_JUMP", 19, "arg0: pair index. The reading jumped, so following stopped"),
         ],
     ),
     "EstopState": (

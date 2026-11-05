@@ -20,10 +20,17 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from rac_kinematics import blend, load_chain, min_duration
+from rac_kinematics import (
+    advance_jerk_limited_reference_over_elapsed,
+    blend,
+    gripper_assist_torque,
+    load_chain,
+    min_duration,
+)
 from rac_link._gen import (
     JOINTS,
     AckStatus,
@@ -70,8 +77,22 @@ log = logging.getLogger(__name__)
 
 STATUS_PERIOD_S = 0.1
 GUIDE_PERIOD_S = 0.01
+TARGET_STREAM_PERIOD_S = 0.02
 FF_VALID_MS = 200
 DISCOVER_SETTLE_S = 0.15
+
+
+@dataclass
+class _LiveTarget:
+    """One arm following a target that keeps changing: a slider or an end-effector drag."""
+
+    position: np.ndarray
+    goal: np.ndarray
+    velocity_limit: np.ndarray
+    source: int
+    last_s: float
+    velocity: np.ndarray = field(default_factory=lambda: np.zeros(JOINTS))
+    acceleration: np.ndarray = field(default_factory=lambda: np.zeros(JOINTS))
 
 
 def _err(code: str, message: str) -> ServiceError:
@@ -101,8 +122,11 @@ class Runtime:
             threading.Thread(target=self._sample_flush_loop, name="rac-samples", daemon=True),
             threading.Thread(target=self._guide_loop, name="rac-guide", daemon=True),
             threading.Thread(target=self._policy_loop, name="rac-policy", daemon=True),
+            threading.Thread(target=self._target_stream_loop, name="rac-target-stream", daemon=True),
         ]
         self.guide_arms: dict[int, bool] = {}  # arm -> gravity compensation on
+        self.guide_gripper_velocity: dict[int, float] = {}
+        self.live_targets: dict[int, _LiveTarget] = {}
 
         self.teleop_active = False
         self.teleop_pairs: list[int] = []
@@ -593,11 +617,21 @@ class Runtime:
                     tau = [0.0] * JOINTS
                 else:
                     gravity = self._chain(spec).gravity_torque(np.array(state.position[:6]))
-                    tau = [float(v) for v in gravity] + [0.0]
+                    tau = [float(v) * s for v, s in zip(gravity, spec.gravity_scale, strict=True)]
+                    tau.append(self._gripper_assist(int(arm), spec, state) if guided else 0.0)
                 try:
                     device.feedforward(int(arm), tau, FF_VALID_MS)
                 except ControllerError:
                     break
+
+    def _gripper_assist(self, arm: int, spec, state) -> float:
+        calibration = self.applied.get(arm)
+        closed = calibration.gripper_closed if calibration else spec.gripper_raw_closed
+        opened = calibration.gripper_open if calibration else spec.gripper_raw_open
+        span = opened - closed
+        filtered = 0.7 * self.guide_gripper_velocity.get(arm, 0.0) + 0.3 * state.velocity[JOINTS - 1] * span
+        self.guide_gripper_velocity[arm] = filtered
+        return gripper_assist_torque(closed + state.position[JOINTS - 1] * span, filtered, closed, opened)
 
     # ------------------------------------------------------------- calibration
 
@@ -1018,6 +1052,7 @@ class Runtime:
             self._set_source(int(ControlSource.NONE))
 
     def _execute(self, arm_points: dict[int, np.ndarray], dt_s: float, source: int) -> Job:
+        self.live_targets.clear()
         """The one execution entry for computer-side targets."""
         with self.lock:
             device = self._dev()
@@ -1116,11 +1151,52 @@ class Runtime:
                 generation = device.next_generation()
                 self._guard(lambda: device.set_mode(Mode.HOST_TARGET, 1 << arm_id, source_id, generation=generation))
                 self._set_source(source_id)
-            ack = device.send_points(arm_id, [pose], 20_000, self.policy_exec_seq, source_id)
-            self.policy_exec_seq += 1
-            if ack.status not in (AckStatus.OK, AckStatus.QUEUE_FULL):
-                raise _err("control.rejected", f"target rejected: {ack.status.name}")
-            return {"ok": True, "queue_free": ack.queue_free}
+            live = self.live_targets.get(arm_id) if mode_ok else None
+            if live is None:
+                start = list(state.target) if mode_ok else self._current_pose(arm_id)
+                live = _LiveTarget(
+                    position=np.array(start, dtype=float),
+                    goal=np.array(pose),
+                    velocity_limit=np.array(spec.velocity_limit),
+                    source=source_id,
+                    last_s=time.monotonic(),
+                )
+                self.live_targets[arm_id] = live
+            live.goal = np.array(pose)
+            return {"ok": True}
+
+    def _target_stream_loop(self) -> None:
+        """Walk each live target with limited jerk, so a jumpy slider cannot jerk the arm."""
+        while not self._stop.is_set():
+            time.sleep(TARGET_STREAM_PERIOD_S)
+            if not self.live_targets:
+                continue
+            with self.lock:
+                device = self.device
+                if not device or not device.is_open:
+                    self.live_targets.clear()
+                    continue
+                now = time.monotonic()
+                for arm_id, live in list(self.live_targets.items()):
+                    if self.source != live.source:
+                        del self.live_targets[arm_id]
+                        continue
+                    elapsed, live.last_s = now - live.last_s, now
+                    if self.paused:
+                        continue
+                    live.position, live.velocity, live.acceleration = advance_jerk_limited_reference_over_elapsed(
+                        live.position, live.velocity, live.acceleration, live.goal, live.velocity_limit, elapsed
+                    )
+                    try:
+                        device.send_points(
+                            arm_id, [live.position.tolist()], int(TARGET_STREAM_PERIOD_S * 1e6), self.policy_exec_seq, live.source
+                        )
+                    except ControllerError:
+                        del self.live_targets[arm_id]
+                        continue
+                    self.policy_exec_seq += 1
+                    if np.array_equal(live.position, live.goal) and not live.velocity.any():
+                        del self.live_targets[arm_id]
 
     def motion_home(self, arms: list[str] | None = None, duration_s: float = 3.0) -> dict:
         names = arms or [a["arm"] for a in self.status()["arms"] if a.get("bound") and a["arm"].endswith("follower")]
@@ -1146,6 +1222,7 @@ class Runtime:
             device = self._dev()
             generation = device.next_generation()
             self.guide_arms[arm_id] = gravity
+            self.guide_gripper_velocity.pop(arm_id, None)
             self._guard(lambda: device.set_mode(Mode.GUIDE, 1 << arm_id, ControlSource.GUIDE, generation=generation))
             self._set_source(int(ControlSource.GUIDE))
             self._emit("guide_started", arm=arm, gravity=gravity)
@@ -1169,6 +1246,7 @@ class Runtime:
     def _stop_everything(self, kind: int) -> None:
         device = self.device
         self.executor.cancel()
+        self.live_targets.clear()
         self._suspend_policy("stopped")
         self.teleop_active = False
         self.teleop_pairs = []

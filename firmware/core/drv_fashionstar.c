@@ -9,7 +9,7 @@
 #define RSP_H1 0x1Cu
 
 #define MONITOR_PARAM_SIZE 16u
-#define SYNC_ANGLE_RECORD_SIZE 11u
+#define SYNC_ANGLE_RECORD_SIZE 15u
 
 uint8_t fs_checksum(const uint8_t *data, size_t len)
 {
@@ -47,10 +47,10 @@ size_t fs_encode_sync_monitor(uint8_t *out, const uint8_t *ids, uint8_t count)
 }
 
 size_t fs_encode_sync_angle(uint8_t *out, const uint8_t *ids, const float *degrees, uint8_t count,
-                            uint32_t interval_ms, uint16_t power_mw)
+                            uint32_t interval_ms, uint16_t accel_ms, uint16_t decel_ms, uint16_t power_mw)
 {
     uint8_t *p = out + 4;
-    *p++ = FS_CODE_SET_ANGLE_MTURN;
+    *p++ = FS_CODE_SET_ANGLE_MTURN_INTERVAL;
     *p++ = SYNC_ANGLE_RECORD_SIZE;
     *p++ = count;
     for (uint8_t i = 0; i < count; i++) {
@@ -64,6 +64,10 @@ size_t fs_encode_sync_angle(uint8_t *out, const uint8_t *ids, const float *degre
         *p++ = (uint8_t)(interval_ms >> 8);
         *p++ = (uint8_t)(interval_ms >> 16);
         *p++ = (uint8_t)(interval_ms >> 24);
+        *p++ = (uint8_t)accel_ms;
+        *p++ = (uint8_t)(accel_ms >> 8);
+        *p++ = (uint8_t)decel_ms;
+        *p++ = (uint8_t)(decel_ms >> 8);
         *p++ = (uint8_t)power_mw;
         *p++ = (uint8_t)(power_mw >> 8);
     }
@@ -77,6 +81,12 @@ size_t fs_encode_stop(uint8_t *out, uint8_t servo_id, uint8_t method, uint16_t p
     out[6] = (uint8_t)power_mw;
     out[7] = (uint8_t)(power_mw >> 8);
     return finish(out, FS_CODE_STOP_ON_CONTROL, 4);
+}
+
+size_t fs_encode_reset_turns(uint8_t *out, uint8_t servo_id)
+{
+    out[4] = servo_id;
+    return finish(out, FS_CODE_RESET_TURNS, 1);
 }
 
 float fs_temperature_c(uint16_t raw)

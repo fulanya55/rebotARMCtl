@@ -189,7 +189,10 @@ class TestRoutes:
 
     def test_robot_descriptions_are_served(self, lab):
         assert lab.get("/robots/rebot_b601_rs/urdf/ReBot_Arm_RS.urdf").status_code == 200
-        assert lab.get("/robots/star_arm_102/urdf/star_arm_102.urdf").status_code == 200
+        assert lab.get("/robots/star_arm_102/fl/urdf/star_arm_102_fl.urdf").status_code == 200
+        assert lab.get("/robots/star_arm_102/fl/meshes/link1.STL").status_code == 200
+        assert lab.get("/robots/star_arm_102/ld_hd/urdf/star_arm_102_ld_hd.urdf").status_code == 200
+        assert lab.get("/robots/star_arm_102/ld_hd/meshes/link1.STL").status_code == 200
 
 
 class TestLeRobotProxies:

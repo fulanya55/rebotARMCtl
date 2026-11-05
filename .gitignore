@@ -25,10 +25,9 @@ _autosave-*
 ~*.lck
 ~$*
 
-# Local runtime data and downloaded robot meshes without a redistribution grant
+# Local runtime data
 .rac/
 outputs/
-assets/robots/star_arm_102/upstream/
 
 # Editor and OS
 .vscode/

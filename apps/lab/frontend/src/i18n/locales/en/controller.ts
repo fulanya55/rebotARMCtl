@@ -68,6 +68,7 @@ export default {
     queue_underrun: "Action queue empty, holding the last target",
     stale_rejected: "Rejected a command from an old generation",
     leader_stale: "Leader data stopped, follower holding",
+    leader_jump: "Leader reading jumped, following stopped. Check its zero and reconnect",
     estop_reset: "Emergency stop reset",
   },
   common: {

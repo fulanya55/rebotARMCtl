@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from .chain import Chain, IkResult, matrix_to_rpy, pose_from_xyz_rpy
+from .motion_profiles import advance_jerk_limited_reference_over_elapsed, gripper_assist_torque
 from .trajectory import TeachPoint, TeachProgram, blend, min_duration, retime, window
 
 ARM_JOINTS = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
@@ -24,6 +25,8 @@ def load_chain(urdf_relative: str, end_effector: str) -> Chain:
 
 
 __all__ = [
+    "advance_jerk_limited_reference_over_elapsed",
+    "gripper_assist_torque",
     "ARM_JOINTS",
     "Chain",
     "IkResult",
