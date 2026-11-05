@@ -1,0 +1,45 @@
+{
+  "meta": {
+    "filename": "sync-controller.kicad_pro",
+    "version": 3
+  },
+  "board": {
+    "design_settings": {
+      "defaults": {}
+    }
+  },
+  "sheets": [
+    [
+      "b75a7408-cf20-5695-b596-74d081197e9a",
+      "Root"
+    ],
+    [
+      "a14fbae8-f982-5f11-b375-773476cf9765",
+      "USB and power"
+    ],
+    [
+      "f8626405-2b20-5a88-9a6b-d7f63576637f",
+      "STM32G474RET6"
+    ],
+    [
+      "7ae55022-063a-5315-9077-ec120decb443",
+      "Emergency stop and sync"
+    ],
+    [
+      "f0478b75-52fd-5842-8b2b-1949da655ab9",
+      "CAN1 isolated port"
+    ],
+    [
+      "bc046cdd-72d2-50fb-aaca-99294ceda63f",
+      "CAN2 isolated port"
+    ],
+    [
+      "69b47bd6-b8eb-5fa0-ab5d-43a9f7354c09",
+      "UART1 isolated servo port"
+    ],
+    [
+      "2e6b1d9b-dd17-5f2c-a163-72d374d26162",
+      "UART2 isolated servo port"
+    ]
+  ]
+}

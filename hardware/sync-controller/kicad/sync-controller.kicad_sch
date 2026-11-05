@@ -1,0 +1,287 @@
+(kicad_sch
+	(version 20250114)
+	(generator "rac_gen_sch")
+	(generator_version "1.0")
+	(uuid "b75a7408-cf20-5695-b596-74d081197e9a")
+	(paper "A3")
+	(title_block
+		(title "RAC sync controller")
+		(date "2026-11-05")
+		(rev "A")
+		(company "rebotARMCtl")
+		(comment 1 "2 x isolated CAN, 2 x isolated servo UART, emergency stop, USB-C. Not yet built or tested.")
+	)
+	(lib_symbols)
+	(sheet
+		(at 25.4 40.64)
+		(size 45.72 25.4)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "a14fbae8-f982-5f11-b375-773476cf9765")
+		(property "Sheetname" "USB and power"
+			(at 25.4 39.93 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "power.kicad_sch"
+			(at 25.4 66.64 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "sync-controller"
+				(path "/b75a7408-cf20-5695-b596-74d081197e9a"
+					(page "2")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 86.36 40.64)
+		(size 45.72 25.4)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "f8626405-2b20-5a88-9a6b-d7f63576637f")
+		(property "Sheetname" "STM32G474RET6"
+			(at 86.36 39.93 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "mcu.kicad_sch"
+			(at 86.36 66.64 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "sync-controller"
+				(path "/b75a7408-cf20-5695-b596-74d081197e9a"
+					(page "3")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 147.32 40.64)
+		(size 45.72 25.4)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "7ae55022-063a-5315-9077-ec120decb443")
+		(property "Sheetname" "Emergency stop and sync"
+			(at 147.32 39.93 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "safety.kicad_sch"
+			(at 147.32 66.64 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "sync-controller"
+				(path "/b75a7408-cf20-5695-b596-74d081197e9a"
+					(page "4")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 208.28 40.64)
+		(size 45.72 25.4)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "f0478b75-52fd-5842-8b2b-1949da655ab9")
+		(property "Sheetname" "CAN1 isolated port"
+			(at 208.28 39.93 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "port_can1.kicad_sch"
+			(at 208.28 66.64 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "sync-controller"
+				(path "/b75a7408-cf20-5695-b596-74d081197e9a"
+					(page "5")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 269.24 40.64)
+		(size 45.72 25.4)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "bc046cdd-72d2-50fb-aaca-99294ceda63f")
+		(property "Sheetname" "CAN2 isolated port"
+			(at 269.24 39.93 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "port_can2.kicad_sch"
+			(at 269.24 66.64 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "sync-controller"
+				(path "/b75a7408-cf20-5695-b596-74d081197e9a"
+					(page "6")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 25.4 86.36)
+		(size 45.72 25.4)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "69b47bd6-b8eb-5fa0-ab5d-43a9f7354c09")
+		(property "Sheetname" "UART1 isolated servo port"
+			(at 25.4 85.65 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "port_uart1.kicad_sch"
+			(at 25.4 112.36 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "sync-controller"
+				(path "/b75a7408-cf20-5695-b596-74d081197e9a"
+					(page "7")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 86.36 86.36)
+		(size 45.72 25.4)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "2e6b1d9b-dd17-5f2c-a163-72d374d26162")
+		(property "Sheetname" "UART2 isolated servo port"
+			(at 86.36 85.65 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "port_uart2.kicad_sch"
+			(at 86.36 112.36 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "sync-controller"
+				(path "/b75a7408-cf20-5695-b596-74d081197e9a"
+					(page "8")
+				)
+			)
+		)
+	)
+	(sheet_instances
+		(path "/"
+			(page "1")
+		)
+	)
+	(embedded_fonts no)
+)
