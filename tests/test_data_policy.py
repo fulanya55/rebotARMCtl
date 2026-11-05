@@ -10,6 +10,19 @@ import pytest
 from rac_data import ArmTrack, CameraTrack, align_episode, control_intervals
 
 
+def test_model_config_is_credited_only_to_episodes_a_policy_drove():
+    from rac_data.writer import episode_model_config
+    from rac_link.protocol_constants import SOURCE_NAMES
+
+    raw = {"last_policy_config": {"backend": "mock"}}
+    by_hand = [{"source": SOURCE_NAMES["teleop"]}]
+    by_model = [{"source": SOURCE_NAMES["policy"]}, {"source": SOURCE_NAMES["intervention"]}]
+    assert episode_model_config({}, raw, by_hand) is None
+    assert episode_model_config({}, raw, by_model) == {"backend": "mock"}
+    named = {"model_config": {"checkpoint": "named"}}
+    assert episode_model_config(named, raw, by_hand) == {"checkpoint": "named"}
+
+
 def fake_samples(start_us, count, period_us, value_at, source=1, valid=0x7F, seq_gap_at=None):
     out = []
     seq = 1
@@ -164,6 +177,20 @@ def sim_cameras():
 
 
 class TestRecordingToLeRobot:
+    def test_frames_from_before_the_start_are_left_out(self, sim_cameras, tmp_path):
+        from rac_data.recorder import CameraRecorder
+        from rac_link.clock import host_now_us
+
+        for attempt in range(3):
+            camera = CameraRecorder(sim_cameras[0], tmp_path / str(attempt))
+            camera.not_before_us = host_now_us()
+            camera.start()
+            time.sleep(0.2)
+            camera.stop_event.set()
+            camera.join(timeout=10)
+            assert camera.index, camera.error
+            assert all(f["host_ts_us"] >= camera.not_before_us for f in camera.index)
+
     def test_full_pipeline(self, bound_rig, sim_cameras, tmp_path):
         """A real episode through real capture into a dataset LeRobot itself can load."""
         from rac_data.browse import check_mergeable, episode_data, list_episodes, trajectory_for_replay
@@ -177,6 +204,7 @@ class TestRecordingToLeRobot:
         rig.client.teleop_enter()
         rig.client.teleop_start(follow="relative")
         rig.client.sil_inject("HAND_SINE", arg=2, values=[0.3, 0, 0, 0, 0, 0, 0])
+        time.sleep(0.05)  # samples older than one service period still carry the previous source
 
         writer = DatasetWriter()
         recorder = Recorder(rig.client, writer)
@@ -254,6 +282,29 @@ class TestRecordingToLeRobot:
         check = check_mergeable([root, root])
         assert check["ok"]
 
+        # 2.3: export, import, and a real merge through LeRobot's aggregator.
+        from rac_data.browse import export_dataset, import_dataset, merge_datasets
+
+        copy = tmp_path / "copy" / "ds_copy"
+        copy.parent.mkdir()
+        assert export_dataset(root, copy)["path"] == str(copy)
+        (tmp_path / "managed").mkdir()
+        imported = import_dataset(copy, tmp_path / "managed")
+        assert imported["episodes"] == 2
+        with pytest.raises(ValueError):
+            import_dataset(tmp_path / "managed", tmp_path / "managed")  # not a dataset
+
+        merged = tmp_path / "merged"
+        result = merge_datasets([root, copy], merged)
+        assert result["episodes"] == 4
+        merged_set = LeRobotDataset("local/merged", root=merged)
+        assert merged_set.meta.total_episodes == 4
+        assert merged_set[0]["observation.state"].shape[0] == 7
+        # Annotations and raw timelines come along, renumbered for the later dataset.
+        after = list_episodes(merged)
+        assert [e["result"] for e in after] == ["success", "failure", "success", "failure"]
+        assert (merged / "meta" / "rac" / "episode_000002" / "left_follower.parquet").exists()
+
     def test_an_annotation_edit_never_touches_samples(self, tmp_path):
         from rac_data import AnnotationStore
 
@@ -318,6 +369,21 @@ class TestPolicyWorker:
         yield
         stop.set()
         thread.join(timeout=3)
+
+    def test_a_dead_model_process_ends_the_run_and_holds(self, bound_rig):
+        import subprocess
+        import sys
+
+        rig = bound_rig
+        rig.client.policy_start(self.CONFIG)
+        dead = subprocess.Popen([sys.executable, "-c", "raise SystemExit(3)"])
+        rig.server.runtime.policy_process = dead
+        rig.wait(lambda: rig.status()["policy"]["state"] == "idle", what="the run ending")
+        rig.wait(lambda: any(e.get("kind") == "policy_failed" for e in rig.events), what="the failure event")
+        failure = next(e for e in rig.events if e.get("kind") == "policy_failed")
+        assert failure["exit_code"] == 3
+        assert failure["severity"] == 2
+        assert rig.status()["source"] == "none"
 
     def test_worker_moves_the_arm_and_stops_on_takeover(self, bound_rig, camera):
         from rac_policy.worker import run

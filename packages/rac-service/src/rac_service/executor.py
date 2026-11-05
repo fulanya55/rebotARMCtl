@@ -13,10 +13,10 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
+from rac_link._gen import AckStatus
 from rac_link.clock import host_now_us
 from rac_link.device import ControllerDevice, ControllerError
 from rac_link.protocol_constants import CHUNK_POINTS
-from rac_link._gen import AckStatus
 
 log = logging.getLogger(__name__)
 

@@ -49,7 +49,17 @@ from rac_link.clock import host_now_us
 from rac_link.device import ControllerDevice, ControllerError
 from rac_link.ipc import ServiceError
 from rac_link.protocol_constants import SOURCE_BY_VALUE, SOURCE_NAMES
-from rac_link.robots import ARM_BY_NAME, ARM_NAMES, PAIR_ARMS, PORT_KIND, PORT_NAMES, SPEC_BY_KEY, SPECS, default_mapping, spec_of
+from rac_link.robots import (
+    ARM_BY_NAME,
+    ARM_NAMES,
+    PAIR_ARMS,
+    PORT_KIND,
+    PORT_NAMES,
+    SPEC_BY_KEY,
+    SPECS,
+    default_mapping,
+    spec_of,
+)
 from rac_link.transport import list_candidates
 
 from .action_buffer import make_buffer
@@ -839,9 +849,13 @@ class Runtime:
             config = dict(self._pair_config(index))
             leader_binding = self._binding_of_arm(int(leader))
             follower_binding = self._binding_of_arm(int(follower))
-            if leader_binding and follower_binding and "scale" not in config:
-                config.update(default_mapping(SPEC_BY_KEY[leader_binding["model"]], SPEC_BY_KEY[follower_binding["model"]]))
-                config["preset"] = True
+            if leader_binding and follower_binding:
+                # Fields never set read as the preset, so a partial update still gives
+                # a complete mapping. What was never configured at all is flagged.
+                if "scale" not in config:
+                    config["preset"] = True
+                preset = default_mapping(SPEC_BY_KEY[leader_binding["model"]], SPEC_BY_KEY[follower_binding["model"]])
+                config = {**preset, **config}
             config["leader"] = leader_binding
             config["follower"] = follower_binding
             config.setdefault("enabled", bool(leader_binding and follower_binding))
@@ -1081,7 +1095,6 @@ class Runtime:
         return SOURCE_NAMES[source]
 
     def motion_move_to(self, arm: str, pose, duration_s: float = 2.0, source: str = "teach") -> dict:
-        arm_id = self._arm_id(arm)
         return self.motion_execute(arm, [pose], 0.02, source, True, duration_s)
 
     def motion_set_target(self, arm: str, pose, source: str = "teach") -> dict:
@@ -1365,11 +1378,26 @@ class Runtime:
             self.policy_stats["last_chunk_len"] = len(actions)
             return {"buffered": len(self.policy_buffer)}
 
+    def _check_policy_process(self) -> None:
+        """A model process that ended on its own ends the run, visibly.
+
+        Otherwise the buffer just runs dry and the page keeps saying the model is
+        running while the arm stands still.
+        """
+        process = self.policy_process
+        if process is None or process.poll() is None:
+            return
+        with self.lock:
+            if self.policy_process is process and self.policy_state in ("running", "paused"):
+                self._emit("policy_failed", severity=2, exit_code=process.returncode)
+                self.policy_stop()
+
     def _policy_loop(self) -> None:
         """Feed buffered actions to the controller at the configured action rate."""
         # perf_counter, because monotonic ticks at 15.6 ms on Windows with Python 3.12.
         next_tick = time.perf_counter()
         while not self._stop.is_set():
+            self._check_policy_process()
             config = self.policy_config
             if self.policy_state != "running" or not config or not self.policy_buffer:
                 time.sleep(0.01)

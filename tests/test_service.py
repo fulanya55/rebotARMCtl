@@ -545,3 +545,12 @@ class TestPolicyAndIntervention:
         with pytest.raises(ServiceError) as exc:
             bound_rig.client.policy_submit([[0.0] * 14], token, host_now_us(), 1.0)
         assert exc.value.code == "policy.bad_shape"
+
+
+def test_a_partial_mapping_update_still_reads_back_complete(bound_rig):
+    """The mapping page reads these fields for every joint and breaks without them."""
+    bound_rig.client.teleop_configure([{"pair": 0, "enabled": True, "scale": [1.0] * 7, "offset": [0.0] * 7}])
+    pair = bound_rig.client.teleop_config()["pairs"]["0"]
+    assert pair["source_joint"] == list(range(7))
+    assert pair["gripper_link"] is True
+    assert "preset" not in pair

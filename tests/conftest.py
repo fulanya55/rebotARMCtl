@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
+import tempfile
+
+# Read when the Lab is imported, so it has to be set before any test imports it.
+# Tests never touch the operator's robot records or datasets.
+_LAB_HOME = tempfile.mkdtemp(prefix="rac-lab-home-")
+os.environ["MAKERMODSLAB_HOME"] = _LAB_HOME
+os.environ["HF_LEROBOT_HOME"] = os.path.join(_LAB_HOME, "lerobot")
+os.environ.setdefault("MAKERMODSLAB_OUTPUT_ROOT", _LAB_HOME)
+atexit.register(shutil.rmtree, _LAB_HOME, ignore_errors=True)
+
 import socket
 import subprocess
 import sys

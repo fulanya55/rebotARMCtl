@@ -57,6 +57,7 @@ class CameraRecorder(threading.Thread):
         self._queue: queue.Queue = queue.Queue(maxsize=240)
         self._encoder = threading.Thread(target=self._encode_loop, daemon=True)
         self.dropped = 0
+        self.not_before_us = 0
 
     def run(self) -> None:
         try:
@@ -71,6 +72,10 @@ class CameraRecorder(threading.Thread):
             while not self.stop_event.is_set():
                 frame = reader.next_frame(timeout=0.2)
                 if frame is None:
+                    continue
+                # The shared memory still holds the frame taken before this started,
+                # up to one period old. It is not part of the episode.
+                if frame.host_ts_us < self.not_before_us:
                     continue
                 try:
                     self._queue.put_nowait(frame)
@@ -115,6 +120,7 @@ class EpisodeRecording:
         self.cameras = [CameraRecorder(c, directory / c) for c in config.cameras]
         self.lock = threading.Lock()
         self.status_snapshot: dict | None = None
+        self.last_policy_config: dict | None = None
 
     def on_state(self, batch: list[dict]) -> None:
         if not self.recording:
@@ -136,6 +142,7 @@ class EpisodeRecording:
         except Exception:
             log.exception("could not capture the device state for this episode")
         for camera in self.cameras:
+            camera.not_before_us = self.started_us
             camera.start()
 
     def stop(self) -> None:
@@ -145,6 +152,11 @@ class EpisodeRecording:
             camera.stop_event.set()
         for camera in self.cameras:
             camera.join(timeout=60)
+        try:
+            # A policy may start after the episode does, so this is read at the end.
+            self.last_policy_config = (self.client.status().get("policy") or {}).get("config") or None
+        except Exception:
+            log.exception("could not read the model configuration for this episode")
         (self.directory / "raw.json").write_text(json.dumps(self.to_raw()), encoding="utf-8")
 
     def to_raw(self) -> dict:
@@ -156,6 +168,7 @@ class EpisodeRecording:
                 "samples": self.samples,
                 "events": self.events,
                 "status": self.status_snapshot,
+                "last_policy_config": self.last_policy_config,
                 "cameras": {
                     c.camera: {"index": c.index, "width": c.width, "height": c.height, "dropped": c.dropped, "error": c.error}
                     for c in self.cameras

@@ -22,10 +22,24 @@ import cv2
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from rac_link.protocol_constants import SOURCE_NAMES
 
 from .align import ArmTrack, CameraTrack, align_episode, control_intervals
 from .annotations import AnnotationStore
 from .schema import build_features
+
+
+def episode_model_config(config: dict, raw: dict, intervals: list[dict]) -> dict | None:
+    """The model behind an episode: what the caller named, or the policy that ran.
+
+    The service keeps the last policy's configuration after it stops, so that is only
+    credited to an episode a policy actually drove.
+    """
+    if config.get("model_config") is not None:
+        return config["model_config"]
+    if any(i["source"] == SOURCE_NAMES["policy"] for i in intervals):
+        return raw.get("last_policy_config")
+    return None
 
 log = logging.getLogger(__name__)
 
@@ -259,6 +273,7 @@ class DatasetWriter:
 
         _write_sidecar(root, episode_index, raw, aligned)
         store = AnnotationStore(root)
+        intervals = control_intervals(aligned.frame_times_us, aligned.control_source, aligned.intervention)
         store.set_episode(
             episode_index,
             {
@@ -268,8 +283,8 @@ class DatasetWriter:
                 "calibration_versions": {
                     a["arm"]: a.get("calibration_version") for a in (raw.get("status") or {}).get("arms", []) if a.get("bound")
                 },
-                "model_config": config.get("model_config"),
-                "control_intervals": control_intervals(aligned.frame_times_us, aligned.control_source, aligned.intervention),
+                "model_config": episode_model_config(config, raw, intervals),
+                "control_intervals": intervals,
                 "quality": aligned.quality,
                 "segments": [],
             },
