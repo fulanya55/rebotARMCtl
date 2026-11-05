@@ -23,11 +23,56 @@ only labels, and calibration opens the controller page instead of a step wizard.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .base import ArmFamily, LeaderOption
 
 CONTROLLER_LEADER_KIND = "controller"
+
+_LIBRARY_NAMES = {
+    "leader": ("rac_leader", "rac_right_leader"),
+    "follower": ("rac_follower", "rac_right_follower"),
+}
+
+
+def _calibration_library(side: str) -> str:
+    """The directory the Lab looks in for this side's calibration files.
+
+    The Lab's flows refuse to start without a file there, but the real calibration is
+    versioned per arm serial in the service, which refuses motion without it. So each
+    name a record can use has a stub saying where the calibration really is.
+    """
+    from rac_link.ipc import runtime_dir
+
+    library = runtime_dir() / "lab_calibration" / side
+    library.mkdir(parents=True, exist_ok=True)
+    for name in _LIBRARY_NAMES[side]:
+        stub = library / f"{name}.json"
+        if not stub.exists():
+            stub.write_text(json.dumps({"held_by": "controller service"}), encoding="utf-8")
+    return str(library)
+
+
+def lab_robot_record(mode: str = "single") -> dict[str, str]:
+    """A Lab robot record for the arms on the controller. Its ports are only labels."""
+    record = {
+        "arm_type": "controller",
+        "mode": mode,
+        "leader_kind": CONTROLLER_LEADER_KIND,
+        "leader_port": "controller:left_leader",
+        "follower_port": "controller:left_follower",
+        "leader_config": "rac_leader",
+        "follower_config": "rac_follower",
+    }
+    if mode == "bimanual":
+        record |= {
+            "right_leader_port": "controller:right_leader",
+            "right_follower_port": "controller:right_follower",
+            "right_leader_config": "rac_right_leader",
+            "right_follower_config": "rac_right_follower",
+        }
+    return record
 
 
 class ControllerFamily(ArmFamily):
@@ -53,20 +98,23 @@ class ControllerFamily(ArmFamily):
     telemetry_kind = "degrees"
     default_leader_kind = CONTROLLER_LEADER_KIND
 
+    # The Lab's replay and inference ease the arm in with degree-based rates and
+    # tolerances. These arms report radians and move through the service, whose own
+    # replay and model pages approach through the controller's limits.
+    kinds_on_own_page = {
+        "replay": "Replay for arms on the sync controller runs from the Replay tab of /controller.",
+        "inference": "Models on the sync controller run from the Model tab of /controller.",
+        "remote_inference": "Models on the sync controller run from the Model tab of /controller.",
+    }
+
     def leader_options(self) -> tuple[LeaderOption, ...]:
         return (LeaderOption(id=CONTROLLER_LEADER_KIND, label="Leader on the sync controller"),)
 
     def leader_calibration_dir(self, leader_kind: str | None = None) -> str:
-        # The registry requires an answer, but no calibration file is ever written
-        # here: the service owns calibration, versioned per arm serial.
-        from rac_link.ipc import runtime_dir
-
-        return str(runtime_dir() / "lab_calibration" / "leader")
+        return _calibration_library("leader")
 
     def follower_calibration_dir(self) -> str:
-        from rac_link.ipc import runtime_dir
-
-        return str(runtime_dir() / "lab_calibration" / "follower")
+        return _calibration_library("follower")
 
     def robot_cli_type(self, bimanual: bool) -> str:
         # Both cases are one proxy class: its `arms` list says how many arms it fronts.

@@ -223,10 +223,27 @@ class CamerasBody(BaseModel):
     cameras: dict[str, dict]
 
 
+def _camera_file() -> Path:
+    from rac_link.ipc import runtime_dir
+
+    return runtime_dir() / "cameras.json"
+
+
+def _saved_cameras() -> dict:
+    path = _camera_file()
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            log.warning("ignoring an unreadable %s", path)
+    return {}
+
+
 @router.get("/cameras")
 def cameras_status():
     process = bridge.camera_process
-    return {"running": bool(process and process.poll() is None), "config": bridge.camera_config}
+    running = bool(process and process.poll() is None)
+    return {"running": running, "config": bridge.camera_config if running else _saved_cameras()}
 
 
 @router.get("/cameras/probe")
@@ -239,10 +256,30 @@ def cameras_probe():
     return safe_call(probe_cameras)
 
 
+class LabRobotBody(BaseModel):
+    name: str = "sync_controller"
+    mode: str = "single"
+
+
+@router.post("/lab-robot")
+def lab_robot(body: LabRobotBody):
+    """Save a Lab robot record for these arms, so the Lab's own teleoperation and recording can use them."""
+    from .arms.controller import lab_robot_record
+    from .utils.config import is_valid_robot_name, save_robot_record
+
+    if not is_valid_robot_name(body.name):
+        raise HTTPException(status_code=400, detail="invalid robot name")
+    if body.mode not in ("single", "bimanual"):
+        raise HTTPException(status_code=400, detail="mode must be single or bimanual")
+    save_robot_record(body.name, lab_robot_record(body.mode), allow_create=True)
+    return {"name": body.name, "mode": body.mode}
+
+
 @router.post("/cameras/start")
 def cameras_start(body: CamerasBody):
     stop_cameras()
     bridge.camera_config = body.cameras
+    _camera_file().write_text(json.dumps(body.cameras, indent=2), encoding="utf-8")
     bridge.camera_process = subprocess.Popen(
         [sys.executable, "-m", "rac_camera.capture", "--config", json.dumps({"cameras": body.cameras})]
     )

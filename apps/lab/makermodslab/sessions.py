@@ -948,6 +948,12 @@ def handle_start_session(body: SessionStartBody, websocket_manager=None) -> dict
     # included (it opens the leader the record names, so a hand-edited
     # unknown one must not reach the family).
     require_leader_kind(record["arm_type"], record["leader_kind"])
+    # An extension family can run a kind on its own page instead of this flow.
+    from .arms import registry as _arm_registry
+
+    own_page = getattr(_arm_registry.get(record["arm_type"]), "kinds_on_own_page", {}).get(kind)
+    if own_page:
+        raise ApiError(status_code=400, detail=own_page, code=ErrorCode.ROBOT_NOT_READY)
 
     # The setup kinds skip the record-clean gate (they exist to make records
     # clean); their builders below still refuse a slot with no port.

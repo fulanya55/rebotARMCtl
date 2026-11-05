@@ -204,7 +204,7 @@ const DataPanel: React.FC = () => {
     const stride = Math.max(1, Math.floor(data.length / 600));
     const out: { t: number; state: number; action: number; leader: number }[] = [];
     for (let i = 0; i < data.length; i += stride) {
-      out.push({ t: data.timestamp[i], state: data.state[i][joint], action: data.action[i][joint], leader: data.leader[i][joint] });
+      out.push({ t: data.timestamp[i], state: data.state[i][joint], action: data.action[i][joint], leader: data.leader[i]?.[joint] });
     }
     return out;
   }, [data, joint]);

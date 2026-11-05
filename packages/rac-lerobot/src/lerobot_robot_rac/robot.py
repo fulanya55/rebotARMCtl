@@ -10,6 +10,7 @@ Units are the platform's: joint keys are radians and the gripper is 0..1.
 from __future__ import annotations
 
 import threading
+import time
 from functools import cached_property
 
 import numpy as np
@@ -19,6 +20,19 @@ from rac_link.client import ControllerClient
 from rac_link.robots import JOINT_NAMES
 
 from .config import RacFollowerConfig
+
+
+def wait_for_feedback(arms: list[str], latest: dict, lock: threading.Lock, timeout: float = 3.0) -> None:
+    """Connecting means the arms are reporting, so the first read cannot fail."""
+    deadline = time.monotonic() + timeout
+    while True:
+        with lock:
+            missing = [arm for arm in arms if arm not in latest]
+        if not missing:
+            return
+        if time.monotonic() > deadline:
+            raise ConnectionError(f"no feedback from {', '.join(missing)}: is the arm bound and on the bus?")
+        time.sleep(0.005)
 
 
 def joint_keys(arms: list[str]) -> list[str]:
@@ -43,6 +57,11 @@ class RacFollower(Robot):
         self._readers: dict[str, CameraReader] = {}
         self._latest: dict[str, dict] = {}
         self._lock = threading.Lock()
+
+    @property
+    def cameras(self) -> dict[str, CameraReader]:
+        """The Lab sizes its image writers by this."""
+        return self._readers
 
     @cached_property
     def observation_features(self) -> dict:
@@ -79,6 +98,7 @@ class RacFollower(Robot):
         self._client.on_state(self._on_state)
         for camera in self.config.shared_cameras:
             self._readers.setdefault(camera, CameraReader(camera))
+        wait_for_feedback(self.config.arms, self._latest, self._lock)
 
     def _on_state(self, batch: list[dict]) -> None:
         with self._lock:
@@ -106,6 +126,10 @@ class RacFollower(Robot):
     def send_action(self, action: dict) -> dict:
         if self._client is None:
             raise ConnectionError("not connected")
+        # Teleoperation is the controller's own loop. The Lab's loop still calls this,
+        # and what it passes is what the controller already dispatched.
+        if self.config.source == "teleop":
+            return action
         keys = joint_keys(self.config.arms)
         values = [float(action[key]) for key in keys]
         for index, arm in enumerate(self.config.arms):

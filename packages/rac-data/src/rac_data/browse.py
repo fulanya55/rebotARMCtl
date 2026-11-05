@@ -125,6 +125,14 @@ def episode_data(root: str | Path, episode_index: int, stride: int = 1) -> dict:
     length = len(data["frame_index"])
     picks = list(range(0, length, max(1, stride)))
     pick = lambda key: [data[key][i] for i in picks]  # noqa: E731
+
+    def optional(key: str) -> list:
+        # Only this platform's recordings have these: a dataset from the Lab or an
+        # imported one has plain state and action.
+        if key not in data:
+            return []
+        return [v[0] if isinstance(v, list) and len(v) == 1 else v for v in pick(key)]
+
     videos = {}
     for key, spec in info["features"].items():
         if spec.get("dtype") != "video":
@@ -144,10 +152,10 @@ def episode_data(root: str | Path, episode_index: int, stride: int = 1) -> dict:
         "timestamp": pick("timestamp"),
         "state": pick("observation.state"),
         "action": pick("action"),
-        "leader": pick("observation.leader_state"),
-        "control_source": [v[0] if isinstance(v, list) else v for v in pick("rac.control_source")],
-        "intervention": [v[0] if isinstance(v, list) else v for v in pick("rac.intervention")],
-        "state_valid": [v[0] if isinstance(v, list) else v for v in pick("rac.state_valid")],
+        "leader": optional("observation.leader_state"),
+        "control_source": optional("rac.control_source"),
+        "intervention": optional("rac.intervention"),
+        "state_valid": optional("rac.state_valid"),
         "videos": videos,
         "annotation": AnnotationStore(root).get_episode(episode_index),
     }
@@ -159,8 +167,9 @@ def trajectory_for_replay(root: str | Path, episode_index: int, column: str = "a
     if column not in ("action", "state"):
         raise ValueError("column must be action or state")
     points = np.asarray(data[column], dtype=float)
-    joints = data["joints"]
-    bimanual = len(joints) == 14
+    if points.ndim != 2 or points.shape[1] not in (7, 14):
+        raise ValueError(f"these arms replay 7 or 14 joints, and this dataset has {points.shape[-1]}")
+    bimanual = points.shape[1] == 14
     return {
         "fps": data["fps"],
         "dt_s": 1.0 / data["fps"],

@@ -99,6 +99,8 @@ export default {
   device: {
     controllerTitle: "Controller",
     controllerHint: "Connecting only opens communication. It never energizes a motor.",
+    addToLab: "Add to Lab",
+    addedToLab: "Added as Lab robot {{name}}, ready for teleoperation and recording in the Lab",
     address: "Address",
     simulator: "Simulated controller",
     connect: "Connect",

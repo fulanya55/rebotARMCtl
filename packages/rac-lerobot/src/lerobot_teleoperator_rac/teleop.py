@@ -15,7 +15,7 @@ from functools import cached_property
 
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.teleoperators.teleoperator import Teleoperator
-from lerobot_robot_rac.robot import joint_keys
+from lerobot_robot_rac.robot import joint_keys, wait_for_feedback
 from rac_link.client import ControllerClient
 
 
@@ -68,6 +68,7 @@ class RacLeader(Teleoperator):
         if self.config.manage_session:
             self._client.teleop_enter()
             self._client.teleop_start(follow=self.config.follow)
+        wait_for_feedback(self.config.arms, self._latest, self._lock)
 
     def _on_state(self, batch: list[dict]) -> None:
         with self._lock:

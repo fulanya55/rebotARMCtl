@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -151,6 +153,20 @@ class TestRoutes:
                     break
             assert seen_samples and seen_status
 
+    def test_camera_bindings_survive_a_restart(self, lab):
+        from makermodslab import controller_routes
+
+        cameras = {"env": {"source": "sim", "width": 160, "height": 120, "fps": 10}}
+        post(lab, "/cameras/start", cameras=cameras)
+        try:
+            assert get(lab, "/cameras")["running"]
+        finally:
+            post(lab, "/cameras/stop")
+        controller_routes.bridge.camera_config = {}
+        state = get(lab, "/cameras")
+        assert not state["running"]
+        assert state["config"]["env"]["width"] == 160
+
     def test_a_bad_program_name_cannot_escape_the_directory(self, lab):
         assert lab.get("/api/v1/controller/programs/..%2F..%2Fsecret").status_code in (400, 404)
         response = lab.post("/api/v1/controller/programs", json={"name": "../evil", "arm": "left_follower", "points": []})
@@ -205,8 +221,8 @@ class TestLeRobotProxies:
         rig.client.sil_inject("SET_HAND_POSE", arg=2, values=[0.3, 0, 0, 0, 0, 0, 0])
         rig.wait(lambda: abs(rig.arm("left_follower")["position"][0] - 0.3) < 0.08, what="following")
         rig.wait(lambda: teleop._latest.get("left_follower"), what="teleop sample")
-        action = teleop.get_action()
-        assert action["joint1.pos"] == pytest.approx(0.3, abs=0.08), "reports what was dispatched"
+        # The arm is still closing the last of the distance, so give the report time too.
+        rig.wait(lambda: abs(teleop.get_action()["joint1.pos"] - 0.3) < 0.08, what="the dispatched target")
         teleop.disconnect()
         assert rig.status()["source"] == "none"
 
@@ -226,6 +242,118 @@ class TestLeRobotProxies:
         assert keys[6] == "left_gripper.pos"
         assert keys[7] == "right_joint1.pos"
         assert len(keys) == 14
+
+
+class TestLabSessions:
+    """The Lab's own front door, for a robot record of the controller arm type."""
+
+    def test_a_controller_robot_record_starts_a_teleoperation_session(self, lab, monkeypatch):
+        from rac_link import ipc
+
+        rig = lab.rig
+        monkeypatch.setattr(ipc, "read_endpoint", lambda: {"port": rig.server.port, "token": rig.server.token})
+        post(lab, "/connect", uri=rig.uri)
+        post(
+            lab,
+            "/bind",
+            bindings=[
+                {"port": 0, "arm": "left_follower", "model": "rebot_b601_rs", "serial": "rs-1"},
+                {"port": 2, "arm": "left_leader", "model": "star_102_hd", "serial": "hd-1"},
+            ],
+        )
+        rig.wait_valid("left_follower", "left_leader")
+        post(lab, "/teleop/config", pairs=[{"pair": 0, "enabled": True, "scale": [1.0] * 7, "offset": [0.0] * 7}])
+
+        arms = lab.get("/api/v1/arms").json()["arms"]
+        assert any(f["id"] == "controller" for f in arms)
+
+        from makermodslab.arms.controller import lab_robot_record
+
+        response = lab.post("/api/v1/robots/rac_bench?create=true", json=lab_robot_record())
+        assert response.status_code == 200, response.text
+        try:
+            session = lab.post("/api/v1/sessions", json={"kind": "teleoperation", "robot": "rac_bench"})
+            assert session.status_code == 201, session.text
+            session_id = session.json()["session"]["id"]
+            try:
+                current = lab.get("/api/v1/sessions/current").json()
+                assert current["session"]["kind"] == "teleoperation", current
+                rig.wait(lambda: rig.status()["source"] == "teleop", timeout=30, what="the proxy entering teleoperation")
+            finally:
+                stopped = lab.post(f"/api/v1/sessions/{session_id}/stop", json={})
+                assert stopped.status_code == 200, stopped.text
+            rig.wait(lambda: rig.status()["source"] != "teleop", timeout=30, what="the session letting go")
+        finally:
+            lab.delete("/api/v1/robots/rac_bench")
+
+
+class TestLabRecording:
+    def test_a_lab_recording_produces_a_dataset_the_controller_page_can_replay(self, lab, monkeypatch, tmp_path):
+        from rac_link import ipc
+
+        rig = lab.rig
+        monkeypatch.setattr(ipc, "read_endpoint", lambda: {"port": rig.server.port, "token": rig.server.token})
+        post(lab, "/connect", uri=rig.uri)
+        post(
+            lab,
+            "/bind",
+            bindings=[
+                {"port": 0, "arm": "left_follower", "model": "rebot_b601_rs", "serial": "rs-1"},
+                {"port": 2, "arm": "left_leader", "model": "star_102_hd", "serial": "hd-1"},
+            ],
+        )
+        rig.wait_valid("left_follower", "left_leader")
+        post(lab, "/teleop/config", pairs=[{"pair": 0, "enabled": True, "scale": [1.0] * 7, "offset": [0.0] * 7}])
+        assert post(lab, "/lab-robot", name="rac_rec") == {"name": "rac_rec", "mode": "single"}
+        options = {
+            "dataset_repo_id": "local/rac_lab_rec",
+            "single_task": "test",
+            "num_episodes": 1,
+            "episode_time_s": 3,
+            "reset_time_s": 0,
+            "fps": 15,
+            "video": False,
+        }
+        session = lab.post("/api/v1/sessions", json={"kind": "recording", "robot": "rac_rec", "options": options})
+        assert session.status_code == 201, session.text
+        session_id = session.json()["session"]["id"]
+        try:
+            rig.wait(lambda: rig.status()["source"] == "teleop", timeout=20, what="the recorder entering teleoperation")
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline and lab.get("/api/v1/sessions/current").json()["session"]:
+                time.sleep(1.0)
+            current = lab.get("/api/v1/sessions/current").json()
+            assert current["session"] is None, "the recording never finished"
+            assert current["last_ended"]["phase"] == "completed", current["last_ended"]
+        finally:
+            lab.post(f"/api/v1/sessions/{session_id}/stop", json={})
+        assert rig.status()["source"] != "teleop"
+
+        # The Lab's recording is a real dataset of this arm's seven joints.
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+
+        assert "rac-lab-home-" in str(HF_LEROBOT_HOME), "this test must not write to the real dataset home"
+        roots = list(Path(HF_LEROBOT_HOME).glob("local/rac_lab_rec_*"))
+        assert len(roots) == 1, roots
+        info = json.loads((roots[0] / "meta" / "info.json").read_text(encoding="utf-8"))
+        assert info["robot_type"] == "rac_follower"
+        assert info["total_episodes"] == 1
+        assert info["total_frames"] > 15
+        assert info["features"]["action"]["shape"] == [7]
+
+        # The Lab's own replay and inference send the operator to the controller page,
+        # which replays this same dataset through the controller's limits.
+        for kind, options in (
+            ("replay", {"repo_id": f"local/{roots[0].name}", "episode_index": 0}),
+            ("inference", {"policy_ref": "local/none"}),
+        ):
+            refused = lab.post("/api/v1/sessions", json={"kind": kind, "robot": "rac_rec", "options": options})
+            assert refused.status_code == 400, refused.text
+            assert "/controller" in refused.text
+        result = post(lab, "/replay/episode", root=str(roots[0]), episode=0, speed=1.0, blend_s=0.5)
+        assert result["points"] > 0
+        rig.wait(lambda: rig.status()["source"] == "replay", timeout=5, what="the replay starting")
+        rig.wait(lambda: rig.status()["source"] == "none", timeout=20, what="the replay finishing")
 
 
 class TestReplayRoute:

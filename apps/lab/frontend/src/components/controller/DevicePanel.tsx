@@ -28,6 +28,7 @@ const SIM_URI = "sil://127.0.0.1:5760";
 
 const DevicePanel: React.FC = () => {
   const { t } = useTranslation();
+  const [labRobot, setLabRobot] = useState<string | null>(null);
   const { status, api, models } = useController();
   const { baseUrl } = useApi();
   const [candidates, setCandidates] = useState<Candidate[]>([]);
@@ -76,7 +77,16 @@ const DevicePanel: React.FC = () => {
           <Button size="sm" variant="outline" onClick={() => void refreshCandidates()} disabled={connected}>
             {t("controller.device.scan")}
           </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => quietly(api("/lab-robot", {}).then((robot: { name: string }) => setLabRobot(robot.name)))}
+            data-testid="add-to-lab"
+          >
+            {t("controller.device.addToLab")}
+          </Button>
         </div>
+        {labRobot && <p className="mt-2 text-xs text-muted-foreground">{t("controller.device.addedToLab", { name: labRobot })}</p>}
         {status?.device && (
           <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Stat label={t("controller.device.firmware")} value={status.device.firmware} />
@@ -278,23 +288,13 @@ const PortsCard: React.FC<{ models: { key: string; label: string; port_kind: str
   );
 };
 
-const CAMERAS_KEY = "rac.cameras";
-
 const CamerasCard: React.FC<{ baseUrl: string }> = ({ baseUrl }) => {
   const { t } = useTranslation();
   const { api } = useController();
   const [running, setRunning] = useState(false);
-  const [cameras, setCameras] = useState<Record<string, CameraConfig>>(() => {
-    try {
-      const saved = localStorage.getItem(CAMERAS_KEY);
-      if (saved) return JSON.parse(saved);
-    } catch {
-      /* unavailable storage only loses a convenience */
-    }
-    return {
-      env: { source: "sim", width: 640, height: 480, fps: 30 },
-      wrist: { source: "sim", width: 640, height: 480, fps: 30 },
-    };
+  const [cameras, setCameras] = useState<Record<string, CameraConfig>>({
+    env: { source: "sim", width: 640, height: 480, fps: 30 },
+    wrist: { source: "sim", width: 640, height: 480, fps: 30 },
   });
   const [stamp, setStamp] = useState(0);
 
@@ -302,7 +302,15 @@ const CamerasCard: React.FC<{ baseUrl: string }> = ({ baseUrl }) => {
     api<{ running: boolean; config: Record<string, CameraConfig> }>("/cameras", undefined, { quiet: true })
       .then((state) => {
         setRunning(state.running);
-        if (state.running && Object.keys(state.config).length) setCameras(state.config);
+        // Saved bindings live on the computer, so they survive a new browser too.
+        if (Object.keys(state.config).length) {
+          const loaded: Record<string, CameraConfig> = {};
+          for (const [name, camera] of Object.entries(state.config)) {
+            loaded[name] = { ...camera, source: String(camera.source) };
+          }
+          setCameras(loaded);
+          if (state.running) setStamp(Date.now());
+        }
       })
       .catch(() => undefined);
   }, [api]);
@@ -310,11 +318,6 @@ const CamerasCard: React.FC<{ baseUrl: string }> = ({ baseUrl }) => {
   const update = (name: string, change: Partial<CameraConfig>) => setCameras((c) => ({ ...c, [name]: { ...c[name], ...change } }));
 
   const start = async () => {
-    try {
-      localStorage.setItem(CAMERAS_KEY, JSON.stringify(cameras));
-    } catch {
-      /* see above */
-    }
     const config: Record<string, unknown> = {};
     for (const [name, cam] of Object.entries(cameras)) {
       config[name] = { ...cam, source: /^\d+$/.test(cam.source) ? Number(cam.source) : cam.source };

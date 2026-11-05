@@ -99,6 +99,8 @@ export default {
   device: {
     controllerTitle: "控制器",
     controllerHint: "连接只建立通信，不会给任何电机上电。",
+    addToLab: "添加到 Lab",
+    addedToLab: "已添加为 Lab 机器人 {{name}}，可在 Lab 中遥操作和录制",
     address: "地址",
     simulator: "仿真控制器",
     connect: "连接",
