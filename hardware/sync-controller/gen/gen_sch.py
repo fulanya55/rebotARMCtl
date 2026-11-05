@@ -383,14 +383,15 @@ def main() -> None:
         (OUT / f"{sheet.name}.kicad_sch").write_text(writer.render(), encoding="utf-8", newline=chr(10))
         placed.append((sheet, sheet_uuid, page))
     (OUT / f"{PROJECT}.kicad_sch").write_text(root_document(root_uuid, placed), encoding="utf-8", newline=chr(10))
-    project = {
-        "meta": {"filename": f"{PROJECT}.kicad_pro", "version": 3},
-        "board": {"design_settings": {"defaults": {}}},
-        "sheets": [[root_uuid, "Root"]] + [[u, s.title] for s, u, _ in placed],
-    }
     import json
 
-    (OUT / f"{PROJECT}.kicad_pro").write_text(json.dumps(project, indent=2), encoding="utf-8", newline=chr(10))
+    # Only the sheet list is ours: gen_pcb.py keeps the design rules in this file too.
+    project_path = OUT / f"{PROJECT}.kicad_pro"
+    project = json.loads(project_path.read_text("utf-8")) if project_path.exists() else {}
+    project.setdefault("meta", {"filename": f"{PROJECT}.kicad_pro", "version": 3})
+    project.setdefault("board", {"design_settings": {"defaults": {}}})
+    project["sheets"] = [[root_uuid, "Root"]] + [[u, s.title] for s, u, _ in placed]
+    project_path.write_text(json.dumps(project, indent=2), encoding="utf-8", newline=chr(10))
     print(f"wrote {len(placed) + 1} sheets to {OUT}")
 
 
