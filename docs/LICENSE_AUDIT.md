@@ -9,7 +9,7 @@
 | [Noietch/EVA-CLIENT](https://github.com/Noietch/EVA-CLIENT) | `926cdf4` | Apache-2.0 | **改编**动作缓冲与 StarVLA 客户端，见 `packages/rac-policy`，文件头注明来源 |
 | [starVLA/starVLA](https://github.com/starVLA/starVLA) | `13d8ad4` | MIT | **独立进程服务**，只按其 WebSocket 协议对接，不复制 |
 | [Seeed-Projects/reBot-DevArm](https://github.com/Seeed-Projects/reBot-DevArm) | `5265303` | CERN-OHL-W-2.0（硬件）、Apache-2.0（软件） | **复制** RS 的 URDF 与网格到 `assets/robots/rebot_b601_rs/`，附许可文本 |
-| [servodevelop/Star-Arm-102](https://github.com/servodevelop/Star-Arm-102) | `24e463b` | 分组件声明，硬件文件**无明确授权** | **不复制**。关节尺寸作为事实使用，由 `tools/make_star_urdf.py` 生成简化模型；网格由 `tools/fetch_assets.py` 下载到被 git 忽略的目录，仅供本地查看 |
+| [servodevelop/Star-Arm-102](https://github.com/servodevelop/Star-Arm-102) | `24e463b` | 分组件声明，硬件文件**无明确授权** | **不复制**。关节尺寸作为事实使用，由 `tools/make_star_urdf.py` 生成简化模型，网格不进入本仓库 |
 | [Yang-Ci/ReBot_Arm_DigitalTwin_RS](https://github.com/Yang-Ci/ReBot_Arm_DigitalTwin_RS) | `84c1ea7` | **未声明** | **不复制任何代码**。只参考其公开文档描述的方法与数值（DLS 阻尼范围、MIT 增益、目标影子显示），由本仓库独立实现 |
 | [RobStride/RobStrideSPC](https://github.com/RobStride/RobStrideSPC) | `d8451a4` | **未声明** | **不复制代码**。按协议独立实现 `firmware/core/drv_robstride.c`，帧格式和数值范围属于协议事实 |
 | [servodevelop/servo-uart-rs485-sdk](https://github.com/servodevelop/servo-uart-rs485-sdk) | `f728776` | **未声明** | **不复制代码**。按协议独立实现 `firmware/core/drv_fashionstar.c` |

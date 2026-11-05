@@ -15,7 +15,6 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ._gen import Ack as WireAck
 from ._gen import (
     JOINTS,
     MAX_CHUNK_POINTS,
@@ -47,6 +46,7 @@ from ._gen import (
     TimeSyncReply,
     Torque,
 )
+from ._gen import Ack as WireAck
 from .clock import ClockModel, host_now_us
 from .transport import Transport, open_transport
 from .wire import Deframer, build_frame, make_header

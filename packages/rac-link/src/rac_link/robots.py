@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ._gen import JOINTS, ArmId, ArmModel, MAX_PAIRS, PortId, PortKind
+from ._gen import JOINTS, MAX_PAIRS, ArmId, ArmModel, PortId, PortKind
 
 JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper")
 assert len(JOINT_NAMES) == JOINTS

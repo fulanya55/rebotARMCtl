@@ -222,7 +222,7 @@ class Header:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "Header":
+    def unpack(cls, data: bytes | memoryview) -> Header:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             version=v[0],
@@ -258,7 +258,7 @@ class BindPort:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "BindPort":
+    def unpack(cls, data: bytes | memoryview) -> BindPort:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             port=v[0],
@@ -294,7 +294,7 @@ class SetCalibration:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "SetCalibration":
+    def unpack(cls, data: bytes | memoryview) -> SetCalibration:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             version=v[0],
@@ -338,7 +338,7 @@ class SetPairing:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "SetPairing":
+    def unpack(cls, data: bytes | memoryview) -> SetPairing:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             pair=v[0],
@@ -375,7 +375,7 @@ class TeleopControl:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "TeleopControl":
+    def unpack(cls, data: bytes | memoryview) -> TeleopControl:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             action=v[0],
@@ -405,7 +405,7 @@ class SetRates:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "SetRates":
+    def unpack(cls, data: bytes | memoryview) -> SetRates:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             motor_service_us=list(v[0:4]),
@@ -434,7 +434,7 @@ class SetLimits:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "SetLimits":
+    def unpack(cls, data: bytes | memoryview) -> SetLimits:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             velocity=list(v[0:7]),
@@ -463,7 +463,7 @@ class SetMode:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "SetMode":
+    def unpack(cls, data: bytes | memoryview) -> SetMode:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             mode=v[0],
@@ -496,7 +496,7 @@ class TargetChunk:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "TargetChunk":
+    def unpack(cls, data: bytes | memoryview) -> TargetChunk:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             exec_seq=v[0],
@@ -525,7 +525,7 @@ class Stop:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "Stop":
+    def unpack(cls, data: bytes | memoryview) -> Stop:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             kind=v[0],
@@ -551,7 +551,7 @@ class PauseResume:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "PauseResume":
+    def unpack(cls, data: bytes | memoryview) -> PauseResume:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             pause=v[0],
@@ -575,7 +575,7 @@ class Feedforward:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "Feedforward":
+    def unpack(cls, data: bytes | memoryview) -> Feedforward:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             valid_ms=v[0],
@@ -600,7 +600,7 @@ class Torque:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "Torque":
+    def unpack(cls, data: bytes | memoryview) -> Torque:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             enable=v[0],
@@ -630,7 +630,7 @@ class Ack:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "Ack":
+    def unpack(cls, data: bytes | memoryview) -> Ack:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             acked_seq=v[0],
@@ -676,7 +676,7 @@ class DeviceInfo:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "DeviceInfo":
+    def unpack(cls, data: bytes | memoryview) -> DeviceInfo:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             fw_major=v[0],
@@ -731,7 +731,7 @@ class PortStatus:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "PortStatus":
+    def unpack(cls, data: bytes | memoryview) -> PortStatus:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             port=v[0],
@@ -797,7 +797,7 @@ class ArmState:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "ArmState":
+    def unpack(cls, data: bytes | memoryview) -> ArmState:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             sample_seq=v[0],
@@ -862,7 +862,7 @@ class ControllerStatus:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "ControllerStatus":
+    def unpack(cls, data: bytes | memoryview) -> ControllerStatus:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             uptime_us=v[0],
@@ -906,7 +906,7 @@ class Event:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "Event":
+    def unpack(cls, data: bytes | memoryview) -> Event:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             event_ts_us=v[0],
@@ -935,7 +935,7 @@ class TimeSyncReply:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "TimeSyncReply":
+    def unpack(cls, data: bytes | memoryview) -> TimeSyncReply:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             host_t1_us=v[0],
@@ -965,7 +965,7 @@ class SilInject:
         return struct.pack(self.FORMAT, *values)
 
     @classmethod
-    def unpack(cls, data: bytes | memoryview) -> "SilInject":
+    def unpack(cls, data: bytes | memoryview) -> SilInject:
         v = struct.unpack_from(cls.FORMAT, data)
         return cls(
             op=v[0],

@@ -4,8 +4,7 @@
 The upstream repository has no repository-wide license grant for its hardware
 files, so its URDF and meshes are not redistributed here. Joint placements are
 dimensions read from the published model, and the visuals are plain cylinders
-written by this script. ``tools/fetch_assets.py`` can download the upstream meshes
-to a git-ignored directory for local viewing.
+written by this script.
 """
 
 from __future__ import annotations

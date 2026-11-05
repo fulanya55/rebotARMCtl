@@ -1,6 +1,15 @@
 import numpy as np
 import pytest
-from rac_kinematics import ARM_JOINTS, TeachPoint, TeachProgram, blend, load_chain, min_duration, retime, window
+from rac_kinematics import (
+    ARM_JOINTS,
+    TeachPoint,
+    TeachProgram,
+    blend,
+    load_chain,
+    min_duration,
+    retime,
+    window,
+)
 from rac_link.robots import REBOT_RS, STAR_FL
 
 

@@ -526,7 +526,7 @@ def _py_message(name: str, fields: list[Field]) -> list[str]:
         "        return struct.pack(self.FORMAT, *values)",
         "",
         "    @classmethod",
-        f'    def unpack(cls, data: bytes | memoryview) -> "{name}":',
+        f'    def unpack(cls, data: bytes | memoryview) -> {name}:',
         "        v = struct.unpack_from(cls.FORMAT, data)",
         "        return cls(",
     ]
