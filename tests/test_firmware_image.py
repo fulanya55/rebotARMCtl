@@ -70,6 +70,43 @@ def header_value(name: str) -> int:
     return int(match.group(1))
 
 
+def test_the_flash_image_holds_what_the_elf_says(image):
+    """Every loaded segment, byte for byte, at its physical address.
+
+    Added after a conversion tool wrote the first segment as zeros: the vector table
+    was gone, and nothing short of reading the output would have shown it.
+    """
+    _, _, blob = image
+    data = ELF.read_bytes()
+    phoff = struct.unpack_from("<I", data, 28)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 42)
+    checked = 0
+    for i in range(phnum):
+        kind, offset, _vaddr, paddr, filesz, *_ = struct.unpack_from("<8I", data, phoff + i * phentsize)
+        if kind == 1 and filesz:
+            assert blob[paddr - FLASH[0] : paddr - FLASH[0] + filesz] == data[offset : offset + filesz], hex(paddr)
+            checked += 1
+    assert checked >= 2
+
+
+def test_intel_hex_decodes_back_to_the_image(image):
+    _, _, blob = image
+    text = ELF.with_suffix(".hex").read_text("ascii")
+    decoded = bytearray(b"\xff" * len(blob))
+    upper = 0
+    for line in text.splitlines():
+        record = bytes.fromhex(line[1:])
+        assert sum(record) & 0xFF == 0, "hex record checksum"
+        count, address, kind = record[0], (record[1] << 8) | record[2], record[3]
+        payload = record[4 : 4 + count]
+        if kind == 4:
+            upper = int.from_bytes(payload, "big") << 16
+        elif kind == 0:
+            start = upper + address - FLASH[0]
+            decoded[start : start + count] = payload
+    assert bytes(decoded) == blob
+
+
 def test_stack_and_reset_vectors(image):
     symbols, _, blob = image
     assert vector(blob, 0) == RAM[0] + RAM[1], "the initial stack pointer is the top of RAM"

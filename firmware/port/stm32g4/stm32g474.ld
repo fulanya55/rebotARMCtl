@@ -14,7 +14,7 @@ SECTIONS
 {
     .isr_vector : { KEEP(*(.isr_vector)) } > FLASH
     .text : { *(.text*) *(.rodata*) . = ALIGN(4); } > FLASH
-    .ARM.exidx : { *(.ARM.exidx*) } > FLASH
+    /DISCARD/ : { *(.ARM.exidx*) *(.ARM.extab*) }
     _sidata = LOADADDR(.data);
     .data : ALIGN(4)
     {

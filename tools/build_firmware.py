@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -94,6 +95,41 @@ def build_tests() -> Path:
     return out
 
 
+def load_segments(elf: Path) -> tuple[int, bytes]:
+    """Flash image from an ELF: every loaded segment at its physical address."""
+    data = elf.read_bytes()
+    phoff = struct.unpack_from("<I", data, 28)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 42)
+    segments = []
+    for i in range(phnum):
+        kind, offset, _vaddr, paddr, filesz, _memsz, _flags, _align = struct.unpack_from("<8I", data, phoff + i * phentsize)
+        if kind == 1 and filesz:
+            segments.append((paddr, data[offset : offset + filesz]))
+    start = min(address for address, _ in segments)
+    end = max(address + len(blob) for address, blob in segments)
+    image = bytearray(b"\xff" * (end - start))  # erased flash reads as 0xFF
+    for address, blob in segments:
+        image[address - start : address - start + len(blob)] = blob
+    return start, bytes(image)
+
+
+def intel_hex(start: int, image: bytes, width: int = 32) -> str:
+    def record(kind: int, address: int, payload: bytes) -> str:
+        body = bytes([len(payload), address >> 8, address & 0xFF, kind]) + payload
+        return ":" + body.hex().upper() + f"{(-sum(body)) & 0xFF:02X}"
+
+    lines = []
+    upper = None
+    for offset in range(0, len(image), width):
+        address = start + offset
+        if address >> 16 != upper:
+            upper = address >> 16
+            lines.append(record(4, 0, upper.to_bytes(2, "big")))
+        lines.append(record(0, address & 0xFFFF, image[offset : offset + width]))
+    lines.append(record(1, 0, b""))
+    return chr(10).join(lines) + chr(10)
+
+
 def build_stm32() -> Path:
     """Cross compile for the Cortex-M4F with the same Zig toolchain as the host builds."""
     port = FW / "port" / "stm32g4"
@@ -126,6 +162,9 @@ def build_stm32() -> Path:
         "-ffunction-sections",
         "-fdata-sections",
         "-fno-sanitize=undefined",
+        "-fno-unwind-tables",
+        "-fno-asynchronous-unwind-tables",
+        "-fno-exceptions",
         "-DSTM32G474xx",
         f"-I{FW / 'core'}",
         f"-I{port}",
@@ -158,8 +197,11 @@ def build_stm32() -> Path:
             elf,
         ]
     )
-    for flag, name in (("binary", "rac_controller.bin"), ("hex", "rac_controller.hex")):
-        run([sys.executable, "-m", "ziglang", "objcopy", "-O", flag, elf, out_dir / name])
+    # Not `zig objcopy`: at 0.15.2 it writes a read-only first segment as zeros, which
+    # erases the vector table. tests/test_firmware_image.py compares the result.
+    start, image = load_segments(elf)
+    (out_dir / "rac_controller.bin").write_bytes(image)
+    (out_dir / "rac_controller.hex").write_text(intel_hex(start, image), encoding="ascii", newline=chr(10))
     return elf
 
 
